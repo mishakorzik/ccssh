@@ -1,10 +1,10 @@
 """
  Algorithm registry: what ccssh supports vs OpenSSH (from local `ssh -Q`).
 
-  Honest numbers only: an algorithm counts as supported after loopback AND
-  live-interop tests against a real sshd go green. Weak primitives live in
-  LEGACY (implemented, never offered unless named explicitly).
-  (FIDO2 login additionally needs a
+ Honest numbers only: an algorithm counts as supported after loopback AND
+ live-interop tests against a real sshd go green. Weak primitives live in
+ LEGACY (implemented, never offered unless named explicitly).
+ (FIDO2 login additionally needs a
  hardware token at runtime - see ccssh.sk; all of its software side is
  implemented and tested.)
 """
