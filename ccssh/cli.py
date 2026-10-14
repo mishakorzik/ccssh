@@ -7,12 +7,13 @@
  interactive shell (like `ssh host`); -N means verify/forward mode.
  Passwords and key passphrases are prompted on the terminal (never taken
  from argv, so they stay out of `ps`); --password-env covers
- non-interactive use. -L/-R share the connection with shell/exec through
- the channel multiplexer (one forwarder per connection); -J takes comma
- chains (ProxyJump). -v prints OpenSSH-style debug1 progress
- (negotiation, host key fingerprint, auth); -vv adds full offers and
- per-step debug2 traces. A TCP preflight dial runs before any password
- prompt, so dead servers fail fast instead of asking for a password.
+  non-interactive use. -L/-R/-D share the connection with shell/exec through
+  the channel multiplexer (one port forwarder per connection); -A forwards
+  the local ssh-agent, -X/-Y the local X display (both share it too);
+  -J takes comma chains (ProxyJump). -v prints OpenSSH-style debug1 progress
+  (negotiation, host key fingerprint, auth); -vv adds full offers and
+  per-step debug2 traces. A TCP preflight dial runs before any password
+  prompt, so dead servers fail fast instead of asking for a password.
 """
 from __future__ import annotations
 import argparse
@@ -52,18 +53,28 @@ def build_parser() -> argparse.ArgumentParser:
                    help="ciphers like ssh -c (comma list, +alg/-alg/^alg allowed)")
     p.add_argument("-m", dest="mac_spec", default=None, metavar="mac_spec",
                    help="MACs like ssh -m (comma list, +alg/-alg/^alg allowed)")
+    p.add_argument("-C", dest="compress", action="store_true", default=False,
+                   help="request compression (like ssh -C: zlib@openssh.com)")
     p.add_argument("-Q", dest="query", default=None, metavar="query",
-                   help="query supported algorithms like ssh -Q (cipher, mac, kex, key)")
+                   help="query supported algorithms like ssh -Q (cipher, mac, kex, key, compression)")
     p.add_argument("-i", dest="identity", action="append", default=[])
     p.add_argument("--cert", default=None, help="OpenSSH certificate file (~-cert.pub)")
     p.add_argument("-o", dest="options", action="append", default=[],
-                   help="-o KexAlgorithms=.. -o Ciphers=.. -o MACs=.. -o HostKeyAlgorithms=.. -o ConnectTimeout=.. -o StrictHostKeyChecking=.. -o UserKnownHostsFile=.. (unknown options fail)")
+                   help="-o KexAlgorithms=.. -o Ciphers=.. -o MACs=.. -o HostKeyAlgorithms=.. -o Compression=yes/no -o CompressionLevel=1..9 -o ForwardAgent=yes/no -o ForwardX11=yes/no -o ForwardX11Trusted=yes/no -o IdentityAgent=path -o IdentitiesOnly=yes/no -o ConnectTimeout=.. -o StrictHostKeyChecking=.. -o UserKnownHostsFile=.. (unknown options fail)")
     p.add_argument("-J", dest="jump", default=None,
                    help="jump host [user@]host[:port], comma chains allowed (ProxyJump)")
     p.add_argument("-L", dest="local_fwd", action="append", default=[],
                    help="local forward [bind:]port:host:port (shares the connection)")
     p.add_argument("-R", dest="remote_fwd", action="append", default=[],
                    help="remote forward [bind:]port:host:port (shares the connection)")
+    p.add_argument("-D", dest="dynamic_fwd", action="append", default=[],
+                   help="dynamic forward [bind:]port as a SOCKS proxy (shares the connection)")
+    p.add_argument("-A", dest="forward_agent", action="store_true", default=False,
+                   help="forward the local ssh-agent to the server (like ssh -A)")
+    p.add_argument("-X", dest="forward_x11", action="store_true", default=False,
+                   help="forward the local X display (untrusted, like ssh -X)")
+    p.add_argument("-Y", dest="forward_x11_trusted", action="store_true", default=False,
+                   help="forward the local X display (trusted, like ssh -Y)")
     p.add_argument("-N", action="store_true", help="no remote command (verify/forward mode)")
     p.add_argument("-v", action="count", default=0)
     p.add_argument("-q", action="count", default=0, help="quiet: hush info/diagnostic output")
@@ -123,6 +134,9 @@ def parse_o_options(opts: list[str]) -> dict[str, str]:
 _KNOWN_O_OPTIONS = frozenset({
     "kexalgorithms", "ciphers", "macs", "hostkeyalgorithms",
     "connecttimeout", "stricthostkeychecking", "userknownhostsfile",
+    "compression", "compressionlevel",
+    "forwardagent", "forwardx11", "forwardx11trusted",
+    "identityagent", "identitiesonly",
 })
 
 
@@ -137,11 +151,14 @@ def _check_known_options(o_opts: dict[str, str]) -> None:
 
 # Options taking a separate value (also accepted as -xVALUE / --opt=VALUE).
 _VALUE_OPTS = frozenset({
-    "-p", "-l", "-c", "-m", "-Q", "-i", "--cert", "-o", "-J", "-L", "-R",
+    "-p", "-l", "-c", "-m", "-Q", "-i", "--cert", "-o", "-J", "-L", "-R", "-D",
     "--timeout", "--host-policy", "--known-hosts", "--password-env",
 })
-# Value-less short flags (may cluster: -vv, -vN, -qt).
-_FLAG_OPTS = frozenset({"-v", "-N", "-4", "-6", "-q", "-t", "-T", "-n", "-V"})
+# Value-less short flags (may cluster: -vv, -vN, -qt, -Cv, -AX).
+_FLAG_OPTS = frozenset({
+    "-v", "-N", "-4", "-6", "-q", "-t", "-T",
+    "-n", "-V", "-C", "-A", "-X", "-Y"
+})
 
 
 def _expand_cluster(token: str) -> list[str]:
@@ -283,6 +300,30 @@ def _parse_L(spec: str, default_bind: str = "127.0.0.1") -> tuple[int, str, int,
         raise UsageError(f"bad -L {spec!r}, expected [bind:]port:host:port") from None
 
 
+def _parse_D(spec: str, default_bind: str = "127.0.0.1") -> tuple[int, str]:
+    """
+     [bind:]port -> (port, bind), like `ssh -D`. Bracketed IPv6 binds
+     ([::1]:1080) work; anything else malformed is a usage error.
+    """
+    rest, bind = spec, default_bind
+    if rest.startswith("["):
+        end = rest.find("]")
+        if end < 0 or not rest[end + 1:].startswith(":"):
+            raise UsageError(f"bad -D {spec!r}, expected [bind:]port")
+        bind, rest = rest[1:end], rest[end + 2:]
+    elif rest.count(":") == 1:
+        maybe_b, maybe_p = rest.rsplit(":", 1)
+        if maybe_p.isdigit():
+            bind, rest = maybe_b, maybe_p
+    try:
+        port = int(rest)
+        if not _valid_port(port) or not bind:
+            raise ValueError("bad port/bind")
+        return port, bind
+    except ValueError:
+        raise UsageError(f"bad -D {spec!r}, expected [bind:]port") from None
+
+
 def parse_jump(spec: str, default_user: str) -> tuple[str, str, int]:
     """
      [user@]host[:port] for -J (single hop; see parse_jump_chain).
@@ -320,8 +361,7 @@ class _KbdintAbort(Exception):
 
 def default_identities() -> list[str]:
     """Default key files like OpenSSH (only ones that exist on disk)."""
-    cands = ["id_rsa", "id_ecdsa", "id_ecdsa_sk", "id_ed25519",
-             "id_ed25519_sk", "id_mldsa44_ed25519"]
+    cands = ["id_rsa", "id_ecdsa", "id_ecdsa_sk", "id_ed25519", "id_ed25519_sk", "id_mldsa44_ed25519"]
     out = []
     for name in cands:
         p = os.path.expanduser(f"~/.ssh/{name}")
@@ -357,19 +397,16 @@ def _run_query(kind: str) -> None:
     key = kind.strip().lower().replace("_", "-")
     table = {
         "cipher": algs.SUPPORTED_CIPHERS,
-        "cipher-auth": [c for c in algs.SUPPORTED_CIPHERS
-                        if "gcm" in c or "poly1305" in c],
-        "compression": ["none"],
+        "cipher-auth": [c for c in algs.SUPPORTED_CIPHERS if "gcm" in c or "poly1305" in c],
+        "compression": algs.SUPPORTED_COMPRESSION,
         "mac": algs.SUPPORTED_MACS,
         "kex": algs.SUPPORTED_KEX,
         "key": algs.SUPPORTED_HOSTKEYS,
         "key-cert": [k for k in algs.OPENSSH_KEYS if "cert" in k],
         "key-plain": [k for k in algs.SUPPORTED_HOSTKEYS],
-        "key-sig": sorted({k.replace("-cert-v01@openssh.com", "").replace("-cert", "")
-                           for k in algs.OPENSSH_KEYS}),
+        "key-sig": sorted({k.replace("-cert-v01@openssh.com", "").replace("-cert", "") for k in algs.OPENSSH_KEYS}),
         "protocol-version": ["2"],
-        "sig": sorted({k.replace("-cert-v01@openssh.com", "").replace("-cert", "")
-                       for k in algs.OPENSSH_KEYS}),
+        "sig": sorted({k.replace("-cert-v01@openssh.com", "").replace("-cert", "") for k in algs.OPENSSH_KEYS}),
     }
     if key == "help":
         for name in table:
@@ -676,6 +713,86 @@ def _main_inner(args, opt_tokens: list[str]) -> int:
     ciphers = algs.expand_alg_option(algs.SUPPORTED_CIPHERS, o_opts.get("ciphers") or args.cipher_spec or ",".join(algs.SUPPORTED_CIPHERS))
     macs = algs.expand_alg_option(algs.SUPPORTED_MACS, o_opts.get("macs") or args.mac_spec or ",".join(algs.SUPPORTED_MACS))
     hostkeys = algs.expand_alg_option(algs.SUPPORTED_HOSTKEYS, o_opts.get("hostkeyalgorithms", ",".join(algs.SUPPORTED_HOSTKEYS)))
+    # Compression: -C enables, -o Compression=yes/no overrides it (OpenSSH:
+    # "-C requests compression", "-o Compression=yes" is the same). Level
+    # via -o CompressionLevel=1..9 (default 6, like ssh_config).
+    _comp_raw = o_opts.get("compression")
+    if _comp_raw is None:
+        comp_enabled = bool(args.compress)
+    else:
+        _c = _comp_raw.strip().lower()
+        if _c in ("yes", "true", "1", "zlib@openssh.com", "zlib"):
+            comp_enabled = True
+        elif _c in ("no", "false", "0", "none"):
+            comp_enabled = False
+        else:
+            print(f"ccssh: bad Compression {_comp_raw!r} (must be yes|no)", file=sys.stderr)
+            return 255
+    try:
+        comp_level = int(o_opts.get("compressionlevel", "6"))
+    except ValueError:
+        print(f"ccssh: bad CompressionLevel {o_opts.get('compressionlevel')!r}", file=sys.stderr)
+        return 255
+    if not 1 <= comp_level <= 9:
+        print(f"ccssh: bad CompressionLevel {comp_level!r} (must be 1..9)", file=sys.stderr)
+        return 255
+    # Agent auth: -o IdentityAgent=path (or "none" to disable); IdentitiesOnly
+    # restricts auth to explicit -i files (agent + default files skipped,
+    # unless IdentityAgent is explicitly set).
+    _id_agent_raw = o_opts.get("identityagent")
+    _ident_only_raw = o_opts.get("identitiesonly", "no").strip().lower()
+    if _ident_only_raw not in ("yes", "true", "1", "no", "false", "0"):
+        print(f"ccssh: bad IdentitiesOnly {_ident_only_raw!r} (must be yes|no)", file=sys.stderr)
+        return 255
+    identities_only = _ident_only_raw in ("yes", "true", "1")
+    if _id_agent_raw is None:
+        agent_path = None
+        use_agent = not identities_only
+    elif _id_agent_raw.strip().lower() in ("none", ""):
+        agent_path, use_agent = None, False
+    else:
+        agent_path = os.path.expandvars(os.path.expanduser(_id_agent_raw.strip()))
+        if not agent_path:
+            print("ccssh: bad IdentityAgent (empty)", file=sys.stderr)
+            return 255
+        use_agent = True
+    # Agent (-A) / X11 (-X untrusted, -Y trusted) forwarding. Like -t/-T,
+    # -X/-Y is last-wins from the raw token stream; -o ForwardAgent etc.
+    # can also enable (an explicit -o ...=no never disables a -A/-X flag,
+    # matching how ssh treats command-line flags as sticky requests).
+    def _yes_no(raw: str | None, name: str) -> bool | None:
+        if raw is None:
+            return None
+        v = raw.strip().lower()
+        if v in ("yes", "true", "1"):
+            return True
+        if v in ("no", "false", "0"):
+            return False
+        print(f"ccssh: bad {name} {raw!r} (must be yes|no)", file=sys.stderr)
+        raise UsageError(f"bad {name}")
+    try:
+        o_fwd_agent = _yes_no(o_opts.get("forwardagent"), "ForwardAgent")
+        o_fwd_x11 = _yes_no(o_opts.get("forwardx11"), "ForwardX11")
+        o_fwd_x11t = _yes_no(o_opts.get("forwardx11trusted"), "ForwardX11Trusted")
+    except UsageError as e:
+        print(f"ccssh: {e}", file=sys.stderr)
+        return 255
+    want_agent_fwd = bool(args.forward_agent) or o_fwd_agent is True
+    want_x11 = bool(args.forward_x11)
+    want_x11_trusted = bool(args.forward_x11_trusted)
+    if o_fwd_x11t is True:
+        want_x11, want_x11_trusted = True, True
+    elif o_fwd_x11t is False:
+        want_x11_trusted = want_x11_trusted and want_x11
+    if o_fwd_x11 is True:
+        want_x11 = True
+    elif o_fwd_x11 is False and not args.forward_x11 and not args.forward_x11_trusted:
+        want_x11 = False
+    for _tok in opt_tokens:
+        if _tok == "-X":
+            want_x11, want_x11_trusted = True, False
+        elif _tok == "-Y":
+            want_x11, want_x11_trusted = True, True
     try:
         timeout = float(o_opts.get("connecttimeout", args.timeout))
     except ValueError:
@@ -722,16 +839,20 @@ def _main_inner(args, opt_tokens: list[str]) -> int:
     # -vv: full offers, timeouts, jump info (client._log adds per-step debug).
     if say:
         print(f"debug1: Connecting to {host} [{args.port}] as {user}", file=sys.stderr)
-        print(f"debug1: kex {kex[0]} cipher {ciphers[0]} mac {macs[0]} hostkey {hostkeys[0]} policy {policy}", file=sys.stderr)
+        print(f"debug1: kex {kex[0]} cipher {ciphers[0]} mac {macs[0]} hostkey {hostkeys[0]} comp {'zlib@openssh.com' if comp_enabled else 'none'} policy {policy}", file=sys.stderr)
     if say2:
         print(f"debug2: KEX offer: {','.join(kex)}", file=sys.stderr)
         print(f"debug2: cipher offer: {','.join(ciphers)}", file=sys.stderr)
         print(f"debug2: mac offer: {','.join(macs)}", file=sys.stderr)
         print(f"debug2: hostkey offer: {','.join(hostkeys)}", file=sys.stderr)
+        print(f"debug2: compression: {'zlib@openssh.com,none' if comp_enabled else 'none,zlib@openssh.com'} level={comp_level}", file=sys.stderr)
+        print(f"debug2: agent: {'on' + (f' ({agent_path})' if agent_path else '') if use_agent else 'off'} identities-only={identities_only}", file=sys.stderr)
+        print(f"debug2: forwarding: agent={want_agent_fwd} x11={want_x11} x11-trusted={want_x11_trusted}", file=sys.stderr)
         print(f"debug2: timeout={timeout}s known_hosts={known or '~/.ssh/known_hosts'}", file=sys.stderr)
-    if args.local_fwd and args.remote_fwd:
-        print("ccssh: -L and -R cannot share one connection "
-              "(one forwarder per connection)", file=sys.stderr)
+    n_port_fwds = len(args.local_fwd) + len(args.remote_fwd) + len(args.dynamic_fwd)
+    if n_port_fwds > 1 or (args.local_fwd and args.remote_fwd):
+        print("ccssh: -L, -R and -D cannot share one connection "
+              "(one port forwarder per connection)", file=sys.stderr)
         return 255
     if args.N and args.command:
         print("ccssh: cannot execute command with -N", file=sys.stderr)
@@ -739,10 +860,15 @@ def _main_inner(args, opt_tokens: list[str]) -> int:
     is_tty = sys.stdin.isatty()
     # ask policy needs a prompt hook (tty only; scripts fail closed).
     ask_cb = _make_ask_callback() if (policy == "ask" and is_tty) else None
-    client_opts = dict(timeout=timeout, known_hosts=known, host_policy=policy, kex=kex, ciphers=ciphers, macs=macs, hostkeys=hostkeys, verbose=args.v if not args.q else 0, ask_callback=ask_cb)
+    client_opts = dict(timeout=timeout, known_hosts=known, host_policy=policy, kex=kex, ciphers=ciphers, macs=macs, hostkeys=hostkeys, verbose=args.v if not args.q else 0, ask_callback=ask_cb, compression=comp_enabled, compression_level=comp_level, use_agent=use_agent, agent_path=agent_path)
     # Like OpenSSH: with no -i, offer the default ~/.ssh keys first and
-    # only then fall back to the password prompt.
-    identities = args.identity or default_identities()
+    # only then fall back to agent/password prompts. IdentitiesOnly=yes
+    # restricts auth to explicit -i files (no defaults, no agent unless
+    # IdentityAgent was explicitly set above).
+    if identities_only and not args.identity:
+        identities: list[str] = []
+    else:
+        identities = args.identity or ([] if identities_only else default_identities())
     if say2 and identities != args.identity:
         print(f"debug2: default identities: {','.join(identities) or '(none found)'}",
               file=sys.stderr)
@@ -809,6 +935,28 @@ def _main_inner(args, opt_tokens: list[str]) -> int:
             active.append(fwd)
             if say:
                 print(f"debug1: -R {bind}:{fwd.port}:{rhost}:{rport}", file=sys.stderr)
+        for spec in args.dynamic_fwd:
+            dport, dbind = _parse_D(spec)
+            fwd = c.forward_dynamic(dport, bind=dbind)
+            active.append(fwd)
+            if say:
+                print(f"debug1: -D {dbind}:{fwd.port} (socks)", file=sys.stderr)
+        if want_agent_fwd:
+            c.forward_agent(agent_path)
+            if say:
+                print(f"debug1: agent forwarding enabled{f' via {agent_path}' if agent_path else ''}", file=sys.stderr)
+        if want_x11:
+            try:
+                from ccssh import x11 as _x11_mod
+                _x11_mod.parse_display(None)
+            except Exception:
+                # ssh-like: warn, don't abort (the session still gets a
+                # display; only inbound X connections fail).
+                print("ccssh: warning: no usable local DISPLAY; "
+                      "X11 forwarding will use a fake cookie", file=sys.stderr)
+            c.forward_x11(trusted=want_x11_trusted)
+            if say:
+                print(f"debug1: X11 forwarding enabled (trusted={want_x11_trusted})", file=sys.stderr)
     except Exception as e:
         print(f"ccssh: forward: {e}", file=sys.stderr)
         c.close()
@@ -821,7 +969,7 @@ def _main_inner(args, opt_tokens: list[str]) -> int:
     if args.N:
         if say:
             neg = c.negotiated()
-            print(f"debug1: connected cipher={neg['cipher']} kex={neg['kex']} mac={neg['mac']} strict={neg['strict']}", file=sys.stderr)
+            print(f"debug1: connected cipher={neg['cipher']} kex={neg['kex']} mac={neg['mac']} comp={neg.get('compression', 'none')} strict={neg['strict']}", file=sys.stderr)
         if active:
             print("ccssh: forwards active, Ctrl-C to exit", file=sys.stderr)
             try:
@@ -856,12 +1004,18 @@ def _main_inner(args, opt_tokens: list[str]) -> int:
             if devnull is not None:
                 devnull.close()
 
+    _sess_kw: dict = {}
+    if want_agent_fwd:
+        _sess_kw["forward_agent"] = True
+    if want_x11:
+        _sess_kw["x11"] = True
+        _sess_kw["x11_trusted"] = want_x11_trusted
     if args.command:
         if args.force_tty:  # -t: pty exec, output streams over the terminal
-            return _run_shell(command=" ".join(args.command), pty=True)
+            return _run_shell(command=" ".join(args.command), pty=True, **_sess_kw)
         cmd = " ".join(args.command)
         try:
-            out, err, code = c.exec_command(cmd, raw_bytes=True)
+            out, err, code = c.exec_command(cmd, raw_bytes=True, **_sess_kw)
         except Exception as e:
             print(f"ccssh: exec: {e}", file=sys.stderr)
             return 255
@@ -886,4 +1040,4 @@ def _main_inner(args, opt_tokens: list[str]) -> int:
             return 141 # like dying of SIGPIPE under `... | head`
         return code
     # No command and no -N: interactive shell, like `ssh host`.
-    return _run_shell(pty=not args.no_pty)
+    return _run_shell(pty=not args.no_pty, **_sess_kw)

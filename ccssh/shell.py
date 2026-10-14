@@ -37,20 +37,25 @@ def _write_all(fd: int, data: bytes) -> None:
         mv = mv[n:]
 
 
-def run_interactive(client, sess=None, *, pty: bool = True, command: str | None = None, stdin_fd: int | None = None) -> int:
+def run_interactive(client, sess=None, *, pty: bool = True, command: str | None = None, stdin_fd: int | None = None, forward_agent: bool = False, x11: bool = False, x11_trusted: bool = False) -> int:
     """
      Run a shell session interactively. Opens one if not given.
 
      With command set, runs it on a pty channel instead of a shell
      (`ssh -t host command`). With pty=False no pty is requested
      (`ssh -T`). stdin_fd overrides standard input (`ssh -n` passes
-     /dev/null). Returns the remote exit status (0 when none is sent).
-     Restores the terminal on all exits.
+     /dev/null). `forward_agent` (`ssh -A`) and `x11` (`ssh -X`, trusted
+     with `x11_trusted` for `ssh -Y`) are forwarded to open_shell for a
+     fresh session and ignored when sess is already open. Returns the
+     remote exit status (0 when none is sent). Restores the terminal on
+     all exits.
     """
     own = sess is None
     if own:
         cols, rows = _termsize()
-        sess = client.open_shell(cols=cols, rows=rows, pty=pty, command=command)
+        sess = client.open_shell(cols=cols, rows=rows, pty=pty, command=command,
+                                 forward_agent=forward_agent, x11=x11,
+                                 x11_trusted=x11_trusted)
     if sess is None:
         raise CCSSHError("no shell session")
     t = client._t

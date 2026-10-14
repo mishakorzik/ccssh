@@ -102,7 +102,14 @@ def _do_kex(t: SyncTransport, host_priv, Vc: bytes, Vs: bytes, peer_kex: dict, o
     return K_encoded, Hh
 
 
-def run_once(sock: socket.socket, host_priv, *, password: str = "pw", timeout: float = 10.0, sftp_root: str | None = None, kbdint_password: str | None = None) -> None:
+def run_once(sock: socket.socket, host_priv, *, password: str = "pw", timeout: float = 10.0, sftp_root: str | None = None, kbdint_password: str | None = None, x11_echo: bytes | None = None, agent_probe: dict | None = None) -> None:
+    """
+     Test-only server. `x11_echo` (bytes): after accepting x11-req, open an
+     x11 channel back, send the payload and require the identical echo
+     (proves the client's X11 relay). `agent_probe` ({"blob","data"}):
+     after accepting auth-agent-req, open an auth-agent channel, send an
+     agent SIGN_REQUEST and verify the signature (proves agent relay).
+    """
     t = SyncTransport(sock, SERVER_VERSION, timeout=timeout)
     Vs = SERVER_VERSION
     Vc = t.do_version()
@@ -113,6 +120,11 @@ def run_once(sock: socket.socket, host_priv, *, password: str = "pw", timeout: f
     session_id = Hh
     keys = crypto.derive_keys(K_encoded, Hh, session_id, CIPHER, MAC)
     t.activate(keys, CIPHER, MAC, is_client=False)
+    # Compression, OpenSSH choose_comp semantics: first client method we
+    # also offer wins, per direction. Stub offers none + delayed.
+    comp_c2s = K.negotiate(peer_kex["comp_c2s"], K.COMP_OFFER)
+    comp_s2c = K.negotiate(peer_kex["comp_s2c"], K.COMP_OFFER)
+    t.set_compression(comp_c2s, comp_s2c, 6, is_client=False)
     strict = K.peer_wants_strict(peer_kex["kex"], is_client=False)
     _send_newkeys(t)
     _recv_newkeys(t)
@@ -125,7 +137,10 @@ def run_once(sock: socket.socket, host_priv, *, password: str = "pw", timeout: f
     assert pkt[0] == A.MSG_SERVICE_REQUEST
     t.send_packet(bytes([A.MSG_SERVICE_ACCEPT]) + W.enc_string(b"ssh-userauth"))
     _auth_loop(t, Hh, password, kbdint_password if kbdint_password is not None else password)
-    _connection_loop(t, Vc, Vs, host_priv, session_id, timeout, sftp_root)
+    # Delayed compression starts after USERAUTH_SUCCESS (both sides).
+    t.enable_delayed_compression()
+    _connection_loop(t, Vc, Vs, host_priv, session_id, timeout, sftp_root,
+                     x11_echo=x11_echo, agent_probe=agent_probe)
 
 
 def _auth_loop(t: SyncTransport, Hh: bytes, password: str, kbdint_password: str | None = None) -> None:
@@ -192,8 +207,111 @@ def _auth_loop(t: SyncTransport, Hh: bytes, password: str, kbdint_password: str 
             t.send_packet(bytes([A.MSG_USERAUTH_FAILURE]) + W.enc_namelist(["password", "publickey"]) + W.enc_bool(False))
 
 
-def _connection_loop(t: SyncTransport, Vc: bytes, Vs: bytes, host_priv, session_id: bytes, timeout: float, sftp_root: str | None) -> None:
-    server_chan = 7
+def _stub_x11_probe(t: SyncTransport, client_chan: int, payload: bytes, sch_ref: list[int], pending: list) -> None:
+    """Open an x11 channel to the client, echo-verify one payload."""
+    ours = sch_ref[0]
+    sch_ref[0] += 1
+    t.send_packet(bytes([CH.MSG_CHANNEL_OPEN]) + W.enc_string(b"x11")
+                  + W.enc_u32(ours) + W.enc_u32(CH.WINDOW) + W.enc_u32(CH.MAXPKT)
+                  + W.enc_string(b"127.0.0.1") + W.enc_u32(6000))
+    peer = _stub_await_confirm(t, ours, pending)
+    t.send_packet(bytes([CH.MSG_CHANNEL_DATA]) + W.enc_u32(peer) + W.enc_string(payload))
+    # Expect the identical bytes back (client relayed through a fake X server).
+    # Foreign packets (e.g. the client's exec request, already pipelined)
+    # are stashed for the main loop, never dropped.
+    deadline_extra = 0
+    while True:
+        p = t.recv_packet()
+        r = W.Reader(p)
+        m = r.byte()
+        if m == CH.MSG_CHANNEL_DATA:
+            if r.u32() != ours:
+                pending.append(p)
+                continue
+            if r.string() == payload:
+                break
+            raise ValueError("x11 echo mismatch")
+        if m in (CH.MSG_WINDOW_ADJUST, CH.MSG_CHANNEL_EOF):
+            continue
+        if m == CH.MSG_CHANNEL_CLOSE:
+            raise ValueError("x11 channel closed before echo")
+        pending.append(p)
+        deadline_extra += 1
+        if deadline_extra > 50:
+            raise ValueError("x11 echo not received")
+    t.send_packet(bytes([CH.MSG_CHANNEL_EOF]) + W.enc_u32(peer))
+    t.send_packet(bytes([CH.MSG_CHANNEL_CLOSE]) + W.enc_u32(peer))
+
+
+def _stub_agent_probe(t: SyncTransport, client_chan: int, spec: dict, sch_ref: list[int], pending: list) -> None:
+    """Open an auth-agent channel, verify one agent signature over it."""
+    from ccssh import hostkeys as _HK
+    blob, data = spec["blob"], spec["data"]
+    try:
+        inner_alg, _ = _HK.parse_host_blob(blob)
+    except Exception as e:
+        raise ValueError(f"bad agent probe blob: {e}") from e
+    ours = sch_ref[0]
+    sch_ref[0] += 1
+    t.send_packet(bytes([CH.MSG_CHANNEL_OPEN]) + W.enc_string(b"auth-agent@openssh.com")
+                  + W.enc_u32(ours) + W.enc_u32(CH.WINDOW) + W.enc_u32(CH.MAXPKT))
+    peer = _stub_await_confirm(t, ours, pending)
+    sign_flags = 2 if inner_alg == "ssh-rsa" else 0
+    req = bytes([13]) + W.enc_string(blob) + W.enc_string(data) + W.enc_u32(sign_flags)
+    t.send_packet(bytes([CH.MSG_CHANNEL_DATA]) + W.enc_u32(peer) + W.enc_string(W.enc_u32(len(req)) + req))
+    for _ in range(50):
+        p = t.recv_packet()
+        r = W.Reader(p)
+        m = r.byte()
+        if m == CH.MSG_CHANNEL_DATA:
+            if r.u32() != ours:
+                pending.append(p)
+                continue
+            stream = r.string()
+            br = W.Reader(stream)
+            ln = br.u32()
+            body = br.raw(ln)
+            cr = W.Reader(body)
+            if cr.byte() != 14:
+                raise ValueError("agent channel sent non-sign-response")
+            sig = cr.string()
+            host_alg = "rsa-sha2-256" if inner_alg == "ssh-rsa" else inner_alg
+            if not _HK.verify_host_signature(blob, host_alg, data, sig):
+                raise ValueError("agent signature over forwarded channel invalid")
+            t.send_packet(bytes([CH.MSG_CHANNEL_CLOSE]) + W.enc_u32(peer))
+            return
+        if m in (CH.MSG_WINDOW_ADJUST, CH.MSG_CHANNEL_EOF):
+            continue
+        if m == CH.MSG_CHANNEL_CLOSE:
+            raise ValueError("agent channel closed before signature")
+        pending.append(p)
+    raise ValueError("agent signature not received")
+
+
+def _stub_await_confirm(t: SyncTransport, ours: int, pending: list) -> int:
+    """Wait for CHANNEL_OPEN_CONFIRMATION for our id; return peer id."""
+    for _ in range(50):
+        p = t.recv_packet()
+        r = W.Reader(p)
+        m = r.byte()
+        if m == CH.MSG_CHANNEL_OPEN_CONFIRM:
+            if r.u32() != ours:
+                pending.append(p)
+                continue
+            peer = r.u32()
+            r.u32()
+            r.u32()
+            return peer
+        if m == CH.MSG_CHANNEL_OPEN_FAILURE:
+            raise ValueError("client refused test channel open")
+        if m in (CH.MSG_WINDOW_ADJUST,):
+            continue
+        pending.append(p)
+    raise ValueError("test channel confirm not received")
+
+
+def _connection_loop(t: SyncTransport, Vc: bytes, Vs: bytes, host_priv, session_id: bytes, timeout: float, sftp_root: str | None, *, x11_echo: bytes | None = None, agent_probe: dict | None = None) -> None:
+    server_chan_ref = [7]
     send_lock = threading.Lock()
     fwd: dict[int, object] = {}
     shells: set[int] = set()  # recipient ids with an accepted shell (echo mode)
@@ -233,7 +351,6 @@ def _connection_loop(t: SyncTransport, Vc: bytes, Vs: bytes, host_priv, session_
                     pass
 
     def _rfwd_accept(key: tuple[str, int]) -> None:
-        nonlocal server_chan
         while key in rfwd:
             ls = rfwd.get(key)
             if ls is None:
@@ -243,8 +360,8 @@ def _connection_loop(t: SyncTransport, Vc: bytes, Vs: bytes, host_priv, session_
             except Exception:
                 return
             with send_lock:
-                ours = server_chan
-                server_chan += 1
+                ours = server_chan_ref[0]
+                server_chan_ref[0] += 1
                 rfwd_pending[ours] = conn
                 t.send_packet(bytes([CH.MSG_CHANNEL_OPEN]) + W.enc_string(b"forwarded-tcpip") + W.enc_u32(ours) + W.enc_u32(CH.WINDOW) + W.enc_u32(CH.MAXPKT) + W.enc_string(key[0].encode()) + W.enc_u32(key[1]) + W.enc_string(addr[0].encode()) + W.enc_u32(addr[1]))
 
@@ -268,9 +385,11 @@ def _connection_loop(t: SyncTransport, Vc: bytes, Vs: bytes, host_priv, session_
             except Exception:
                 pass
 
+    pending: list[bytes] = []  # packets stashed by test probes, replayed first
+
     while True:
         try:
-            p = t.recv_raw()
+            p = pending.pop(0) if pending else t.recv_raw()
         except Exception:
             return
         m = p[0]
@@ -326,6 +445,11 @@ def _connection_loop(t: SyncTransport, Vc: bytes, Vs: bytes, host_priv, session_
         if m == K.MSG_KEXINIT:
             peer2 = K.dec_kexinit(p)
             our2 = _send_kexinit(t, initial=False)
+            # Compression must not change across rekey (same rule as client).
+            comp_c2s2 = K.negotiate(peer2["comp_c2s"], K.COMP_OFFER)
+            comp_s2c2 = K.negotiate(peer2["comp_s2c"], K.COMP_OFFER)
+            if (comp_c2s2, comp_s2c2) != (t.comp_c2s, t.comp_s2c):
+                raise ValueError("rekey changed compression")
             Kenc2, _H2 = _do_kex(t, host_priv, Vc, Vs, peer2, our2)
             keys2 = crypto.derive_keys(Kenc2, _H2, session_id, CIPHER, MAC)
             t.stage_rekey(keys2, CIPHER, MAC, is_client=False)
@@ -445,13 +569,14 @@ def _connection_loop(t: SyncTransport, Vc: bytes, Vs: bytes, host_priv, session_
                 except Exception:
                     t.send_packet(bytes([CH.MSG_CHANNEL_OPEN_FAILURE]) + W.enc_u32(client_chan) + W.enc_u32(2) + W.enc_string(b"connect failed") + W.enc_string(b""))
                     continue
-                sch = server_chan
-                server_chan += 1
+                sch = server_chan_ref[0]
+                server_chan_ref[0] += 1
                 fwd[sch] = tcp
                 t.send_packet(bytes([CH.MSG_CHANNEL_OPEN_CONFIRM]) + W.enc_u32(client_chan) + W.enc_u32(sch) + W.enc_u32(CH.WINDOW) + W.enc_u32(CH.MAXPKT))
                 threading.Thread(target=_fwd_relay, args=(client_chan, sch, tcp), daemon=True).start()
                 continue
-            t.send_packet(bytes([CH.MSG_CHANNEL_OPEN_CONFIRM]) + W.enc_u32(client_chan) + W.enc_u32(server_chan) + W.enc_u32(CH.WINDOW) + W.enc_u32(CH.MAXPKT))
+            t.send_packet(bytes([CH.MSG_CHANNEL_OPEN_CONFIRM]) + W.enc_u32(client_chan) + W.enc_u32(server_chan_ref[0]) + W.enc_u32(CH.WINDOW) + W.enc_u32(CH.MAXPKT))
+            server_chan_ref[0] += 1
         elif m == CH.MSG_CHANNEL_REQUEST:
             r = W.Reader(p)
             r.byte()
@@ -486,6 +611,24 @@ def _connection_loop(t: SyncTransport, Vc: bytes, Vs: bytes, host_priv, session_
             if name == b"shell":
                 t.send_packet(bytes([CH.MSG_CHANNEL_SUCCESS]))
                 shells.add(_ch) # echo mode; EOF/CLOSE handled in the main loop
+                continue
+            if name == b"x11-req":
+                # Consume single_connection/auth-proto/auth-cookie/screen.
+                try:
+                    r.bool()
+                    r.string()
+                    r.string()
+                    r.u32()
+                except Exception:
+                    pass
+                t.send_packet(bytes([CH.MSG_CHANNEL_SUCCESS]))
+                if x11_echo is not None:
+                    _stub_x11_probe(t, client_chan, x11_echo, server_chan_ref, pending)
+                continue
+            if name == b"auth-agent-req@openssh.com":
+                t.send_packet(bytes([CH.MSG_CHANNEL_SUCCESS]))
+                if agent_probe is not None:
+                    _stub_agent_probe(t, client_chan, agent_probe, server_chan_ref, pending)
                 continue
             if name == b"exec":
                 cmd = r.string().decode()

@@ -2,7 +2,11 @@
  SSH binary packet transports: blocking sockets (sync) and asyncio (async).
 
  Cipher coverage: AES-CTR with HMAC (plain and -etm), AES-GCM (RFC 5647),
- chacha20-poly1305 (IETF draft). Framing notes:
+ chacha20-poly1305 (IETF draft). Compression: zlib / zlib@openssh.com
+ (RFC 4253 section 6.2, delayed draft) - only the payload is compressed,
+ after auth (delayed) or after NEWKEYS (legacy zlib), with per-direction
+ stateful streams and Z_PARTIAL_FLUSH per packet (see ccssh.compress).
+ Framing notes:
 
  * non-ETM CTR encrypts length + payload; MAC over sequence + plaintext.
  * ETM (see OpenSSH packet.c, aadlen=4): length travels in the CLEAR,
@@ -10,6 +14,9 @@
   padding excludes the length field.
  * GCM/ChaCha behave like ETM (length in clear/separate, tag over it + CT).
  * Before NEWKEYS everything is plaintext without MAC.
+ * With compression, packet_length/MAC are computed from the COMPRESSED
+  payload; encryption happens after compression (and decryption before
+  decompression).
 """
 from __future__ import annotations
 import asyncio
@@ -38,6 +45,16 @@ if TYPE_CHECKING:
 GCM_CIPHERS = ("aes128-gcm@openssh.com", "aes256-gcm@openssh.com")
 CHACHA_CIPHER = "chacha20-poly1305@openssh.com"
 MAX_PACKET = 35000
+
+
+def _new_compressor(level: int):
+    from ccssh import compress as _comp_mod
+    return _comp_mod.Compressor(level)
+
+
+def _new_decompressor():
+    from ccssh import compress as _comp_mod
+    return _comp_mod.Decompressor()
 
 
 class CCSSHError(Exception):
@@ -224,12 +241,101 @@ class SyncTransport:
         self._gs = self._gr = self._cs = self._cr = None
         self._enc_on_send = False
         self._enc_on_recv = False
+        # Compression negotiation (RFC 4253 6.2 + delayed draft). Names are
+        # per direction ("none" | "zlib" | "zlib@openssh.com"); streams exist
+        # only while that direction is actually compressing.
+        self.comp_c2s = "none"
+        self.comp_s2c = "none"
+        self.comp_level = 6
+        self._compressor = None
+        self._decompressor = None
         self.bytes_out = 0
         self.bytes_in = 0
         self.kex_at = time.monotonic()
         self._send_lock = threading.Lock()
         self._staged = None
         self._rxbuf = bytearray()
+
+    # -- compression (1:1 with OpenSSH compress.c / packet.c) --
+    def set_compression(self, c2s: str, s2c: str, level: int = 6, *, is_client: bool = True) -> None:
+        """
+         Record the negotiated methods and activate immediate ("zlib")
+         directions at once. Delayed ("zlib@openssh.com") directions stay
+         pending until enable_delayed_compression() after USERAUTH_SUCCESS.
+
+         c2s/s2c are always client->server / server->client (RFC 4253),
+         regardless of our role: a server's sends are s2c, recvs are c2s.
+        """
+        from ccssh import compress as _comp_mod
+        _comp_mod.check_name(c2s)
+        _comp_mod.check_name(s2c)
+        _comp_mod.check_level(level)
+        self.comp_c2s, self.comp_s2c, self.comp_level = c2s, s2c, level
+        self._comp_is_client = is_client
+        self._compressor = None
+        self._decompressor = None
+        send_name = c2s if is_client else s2c
+        recv_name = s2c if is_client else c2s
+        if send_name == _comp_mod.ZLIB:
+            self._compressor = _comp_mod.Compressor(level)
+        if recv_name == _comp_mod.ZLIB:
+            self._decompressor = _comp_mod.Decompressor()
+
+    def _send_comp_name(self) -> str:
+        return self.comp_c2s if getattr(self, "_comp_is_client", True) else self.comp_s2c
+
+    def _recv_comp_name(self) -> str:
+        return self.comp_s2c if getattr(self, "_comp_is_client", True) else self.comp_c2s
+
+    def enable_delayed_compression(self) -> None:
+        """Start delayed directions after USERAUTH_SUCCESS (idempotent)."""
+        from ccssh import compress as _comp_mod
+        if self._send_comp_name() == _comp_mod.DELAYED and self._compressor is None:
+            self._compressor = _comp_mod.Compressor(self.comp_level)
+        if self._recv_comp_name() == _comp_mod.DELAYED and self._decompressor is None:
+            self._decompressor = _comp_mod.Decompressor()
+
+    def _reset_compression_send(self) -> None:
+        """Re-init the send stream after a key exchange (RFC 4253)."""
+        from ccssh import compress as _comp_mod
+        name = self._send_comp_name()
+        if name == _comp_mod.ZLIB:
+            self._compressor = _comp_mod.Compressor(self.comp_level)
+        elif name == _comp_mod.DELAYED:
+            if self._compressor is not None:  # post-auth rekey: fresh dict
+                self._compressor = _comp_mod.Compressor(self.comp_level)
+            # pre-auth rekey: stays pending (no compression yet)
+        else:
+            self._compressor = None
+
+    def _reset_compression_recv(self) -> None:
+        from ccssh import compress as _comp_mod
+        name = self._recv_comp_name()
+        if name == _comp_mod.ZLIB:
+            self._decompressor = _comp_mod.Decompressor()
+        elif name == _comp_mod.DELAYED:
+            if self._decompressor is not None:
+                self._decompressor = _comp_mod.Decompressor()
+        else:
+            self._decompressor = None
+
+    def _compress_payload(self, payload: bytes) -> bytes:
+        comp = self._compressor
+        if comp is None:
+            return payload
+        try:
+            return comp.compress(payload)
+        except ValueError as e:
+            raise CCSSHError(f"compression failed: {e}") from e
+
+    def _decompress_payload(self, data: bytes) -> bytes:
+        decomp = self._decompressor
+        if decomp is None:
+            return data
+        try:
+            return decomp.decompress(data)
+        except ValueError as e:
+            raise CCSSHError(f"decompression failed: {e}") from e
 
     def _recvn(self, n: int) -> bytes:
         return _recvn_blocking(self.sock, n, self.timeout, self._rxbuf)
@@ -275,6 +381,11 @@ class SyncTransport:
             self.recv_seq = 0
         self._s = self._r = self._gs = self._gr = self._cs = self._cr = None
         self._staged = None
+        # Fresh keys mean fresh compression dictionaries too (RFC 4253), but
+        # the negotiated names survive: set_compression() right after decides
+        # whether streams start now (zlib) or after auth (delayed).
+        self._compressor = None
+        self._decompressor = None
         if cipher == "none":
             return
         kind = _encode_kind(cipher)
@@ -310,6 +421,7 @@ class SyncTransport:
             self._gs = s
         else:
             self._cs = s
+        self._reset_compression_send()
 
     def commit_rekey_recv(self, *, reset_seq: bool = False) -> None:
         if self._staged is None:
@@ -326,6 +438,7 @@ class SyncTransport:
         else:
             self._cr = r
         self._staged = None
+        self._reset_compression_recv()
 
     def send_packet(self, payload: bytes) -> None:
         """
@@ -343,6 +456,9 @@ class SyncTransport:
             self.send_seq = (self.send_seq + 1) & 0xFFFFFFFF
 
     def _encode_packet(self, payload: bytes) -> bytes:
+        # RFC 4253 6.2: only the payload compresses; packet_length/MAC are
+        # computed from the compressed form, encryption goes last.
+        payload = self._compress_payload(payload)
         if self._plain_sending():
             return build_unencrypted_block(payload, 8)
         return _encode_encrypted(self.cipher, self._s, self._gs, self._cs,
@@ -421,7 +537,7 @@ class SyncTransport:
             body = self._recvn(pl)
             _check_padding(body[0], pl)
             self.recv_seq = (self.recv_seq + 1) & 0xFFFFFFFF
-            return body[1:len(body) - body[0]]
+            return self._decompress_payload(body[1:len(body) - body[0]])
         if self.cipher in GCM_CIPHERS:
             if self._gr is None:
                 raise CCSSHError("GCM receiver not activated")
@@ -433,7 +549,7 @@ class SyncTransport:
             pt = self._gr.open(hdr + rest)
             _check_padding(pt[0], pl)
             self.recv_seq = (self.recv_seq + 1) & 0xFFFFFFFF
-            return pt[1:len(pt) - pt[0]]
+            return self._decompress_payload(pt[1:len(pt) - pt[0]])
         if self.cipher == CHACHA_CIPHER:
             if self._cr is None:
                 raise CCSSHError("ChaCha receiver not activated")
@@ -446,7 +562,7 @@ class SyncTransport:
             _plen, pblk = self._cr.open(self.recv_seq, enc_len + rest)
             _check_padding(pblk[0], pl)
             self.recv_seq = (self.recv_seq + 1) & 0xFFFFFFFF
-            return pblk[1:len(pblk) - pblk[0]]
+            return self._decompress_payload(pblk[1:len(pblk) - pblk[0]])
         ctx = self._r
         if ctx is None:
             raise CCSSHError("stream receiver not activated")
@@ -464,7 +580,7 @@ class SyncTransport:
             plain = ctx.decrypt_stream(ct)
             _check_padding(plain[0], pl)
             self.recv_seq = (self.recv_seq + 1) & 0xFFFFFFFF
-            return plain[1:len(plain) - plain[0]]
+            return self._decompress_payload(plain[1:len(plain) - plain[0]])
         first = self._recvn(blk_size)
         pf = ctx.decrypt_stream(first)
         (pl,) = struct.unpack(">I", pf[:4])
@@ -483,7 +599,7 @@ class SyncTransport:
             raise CCSSHError("packet integrity failed")
         _check_padding(plain[4], pl)
         self.recv_seq = (self.recv_seq + 1) & 0xFFFFFFFF
-        return plain[5:4 + pl - plain[4]]
+        return self._decompress_payload(plain[5:4 + pl - plain[4]])
 
     def _plain_receiving(self) -> bool:
         return (self.cipher in ("none",) or (self._r is None and self._gr is None and self._cr is None) or not self._enc_on_recv)
@@ -507,11 +623,85 @@ class AsyncTransport:
         self._gs = self._gr = self._cs = self._cr = None
         self._enc_on_send = False
         self._enc_on_recv = False
+        self.comp_c2s = "none"
+        self.comp_s2c = "none"
+        self.comp_level = 6
+        self._compressor = None
+        self._decompressor = None
         self.bytes_out = 0
         self.bytes_in = 0
         self.kex_at = time.monotonic()
         self._staged = None
         self._send_lock = asyncio.Lock()
+
+    def set_compression(self, c2s: str, s2c: str, level: int = 6, *, is_client: bool = True) -> None:
+        from ccssh import compress as _comp_mod
+        _comp_mod.check_name(c2s)
+        _comp_mod.check_name(s2c)
+        _comp_mod.check_level(level)
+        self.comp_c2s, self.comp_s2c, self.comp_level = c2s, s2c, level
+        self._comp_is_client = is_client
+        self._compressor = None
+        self._decompressor = None
+        send_name = c2s if is_client else s2c
+        recv_name = s2c if is_client else c2s
+        if send_name == _comp_mod.ZLIB:
+            self._compressor = _comp_mod.Compressor(level)
+        if recv_name == _comp_mod.ZLIB:
+            self._decompressor = _comp_mod.Decompressor()
+
+    def _send_comp_name(self) -> str:
+        return self.comp_c2s if getattr(self, "_comp_is_client", True) else self.comp_s2c
+
+    def _recv_comp_name(self) -> str:
+        return self.comp_s2c if getattr(self, "_comp_is_client", True) else self.comp_c2s
+
+    def enable_delayed_compression(self) -> None:
+        from ccssh import compress as _comp_mod
+        if self._send_comp_name() == _comp_mod.DELAYED and self._compressor is None:
+            self._compressor = _comp_mod.Compressor(self.comp_level)
+        if self._recv_comp_name() == _comp_mod.DELAYED and self._decompressor is None:
+            self._decompressor = _comp_mod.Decompressor()
+
+    def _reset_compression_send(self) -> None:
+        from ccssh import compress as _comp_mod
+        name = self._send_comp_name()
+        if name == _comp_mod.ZLIB:
+            self._compressor = _comp_mod.Compressor(self.comp_level)
+        elif name == _comp_mod.DELAYED:
+            if self._compressor is not None:
+                self._compressor = _comp_mod.Compressor(self.comp_level)
+        else:
+            self._compressor = None
+
+    def _reset_compression_recv(self) -> None:
+        from ccssh import compress as _comp_mod
+        name = self._recv_comp_name()
+        if name == _comp_mod.ZLIB:
+            self._decompressor = _comp_mod.Decompressor()
+        elif name == _comp_mod.DELAYED:
+            if self._decompressor is not None:
+                self._decompressor = _comp_mod.Decompressor()
+        else:
+            self._decompressor = None
+
+    def _compress_payload(self, payload: bytes) -> bytes:
+        comp = self._compressor
+        if comp is None:
+            return payload
+        try:
+            return comp.compress(payload)
+        except ValueError as e:
+            raise CCSSHError(f"compression failed: {e}") from e
+
+    def _decompress_payload(self, data: bytes) -> bytes:
+        decomp = self._decompressor
+        if decomp is None:
+            return data
+        try:
+            return decomp.decompress(data)
+        except ValueError as e:
+            raise CCSSHError(f"decompression failed: {e}") from e
 
     async def do_version(self) -> bytes:
         self.writer.write(self.version + b"\r\n")
@@ -549,6 +739,8 @@ class AsyncTransport:
             self.recv_seq = 0
         self._s = self._r = self._gs = self._gr = self._cs = self._cr = None
         self._staged = None
+        self._compressor = None
+        self._decompressor = None
         if cipher == "none":
             return
         kind = _encode_kind(cipher)
@@ -583,6 +775,7 @@ class AsyncTransport:
             self._gs = s
         else:
             self._cs = s
+        self._reset_compression_send()
 
     def commit_rekey_recv(self, *, reset_seq: bool = False) -> None:
         if self._staged is None:
@@ -599,18 +792,21 @@ class AsyncTransport:
         else:
             self._cr = r
         self._staged = None
+        self._reset_compression_recv()
 
     async def send_packet(self, payload: bytes) -> None:
         async with self._send_lock:
             if self.send_seq >= 0xFFFFFFFF:
                 raise CCSSHError("sequence number exhausted: rekey required")
+            orig_len = len(payload)
+            payload = self._compress_payload(payload)
             if self._plain_sending():
                 wire = build_unencrypted_block(payload, 8)
             else:
                 wire = _encode_encrypted(self.cipher, self._s, self._gs, self._cs, self.send_seq, payload)
             self.writer.write(wire)
             await self.writer.drain()
-            self.bytes_out += len(payload)
+            self.bytes_out += orig_len
             self.send_seq = (self.send_seq + 1) & 0xFFFFFFFF
 
     def _plain_sending(self) -> bool:
@@ -671,7 +867,7 @@ class AsyncTransport:
             body = await _recvn_async(self.reader, pl, self.timeout)
             _check_padding(body[0], pl)
             self.recv_seq = (self.recv_seq + 1) & 0xFFFFFFFF
-            return body[1:len(body) - body[0]]
+            return self._decompress_payload(body[1:len(body) - body[0]])
         if self.cipher in GCM_CIPHERS:
             if self._gr is None:
                 raise CCSSHError("GCM receiver not activated")
@@ -683,7 +879,7 @@ class AsyncTransport:
             pt = self._gr.open(hdr + rest)
             _check_padding(pt[0], pl)
             self.recv_seq = (self.recv_seq + 1) & 0xFFFFFFFF
-            return pt[1:len(pt) - pt[0]]
+            return self._decompress_payload(pt[1:len(pt) - pt[0]])
         if self.cipher == CHACHA_CIPHER:
             if self._cr is None:
                 raise CCSSHError("ChaCha receiver not activated")
@@ -695,7 +891,7 @@ class AsyncTransport:
             _plen, pblk = self._cr.open(self.recv_seq, enc_len + rest)
             _check_padding(pblk[0], pl)
             self.recv_seq = (self.recv_seq + 1) & 0xFFFFFFFF
-            return pblk[1:len(pblk) - pblk[0]]
+            return self._decompress_payload(pblk[1:len(pblk) - pblk[0]])
         ctx = self._r
         if ctx is None:
             raise CCSSHError("stream receiver not activated (async)")
@@ -712,7 +908,7 @@ class AsyncTransport:
             plain = ctx.decrypt_stream(ct)
             _check_padding(plain[0], pl)
             self.recv_seq = (self.recv_seq + 1) & 0xFFFFFFFF
-            return plain[1:len(plain) - plain[0]]
+            return self._decompress_payload(plain[1:len(plain) - plain[0]])
         first = await _recvn_async(self.reader, blk_size, self.timeout)
         pf = ctx.decrypt_stream(first)
         (pl,) = struct.unpack(">I", pf[:4])
@@ -731,7 +927,7 @@ class AsyncTransport:
             raise CCSSHError("packet integrity failed (async)")
         _check_padding(plain[4], pl)
         self.recv_seq = (self.recv_seq + 1) & 0xFFFFFFFF
-        return plain[5:4 + pl - plain[4]]
+        return self._decompress_payload(plain[5:4 + pl - plain[4]])
 
     def _plain_receiving(self) -> bool:
         return (self.cipher in ("none",) or (self._r is None and self._gr is None and self._cr is None) or not self._enc_on_recv)

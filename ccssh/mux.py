@@ -52,6 +52,11 @@ class ChannelMux:
         # when two threads set up channels concurrently.
         self.request_lock = threading.Lock()
         self._chan_next = 1
+        # Server-initiated opens routed by channel type (so -R agent/x11
+        # forwarders never steal each other's opens): maps b"forwarded-tcpip"
+        # etc. to dedicated queues. Unregistered types fall back to catch-all
+        # (historical behavior, unchanged).
+        self._inbound: dict[bytes, queue.Queue] = {}
         self._last_io = time.monotonic()
         self._th = threading.Thread(target=self._reader, daemon=True)
 
@@ -162,6 +167,27 @@ class ChannelMux:
     def catch_all(self) -> queue.Queue:
         return self._catch
 
+    def register_inbound(self, channel_type: bytes) -> "queue.Queue":
+        """
+         Dedicated queue for one server-initiated channel type
+         (b"forwarded-tcpip", b"x11", b"auth-agent@openssh.com").
+
+         Lets an agent forwarder, an X11 forwarder and a remote (-R)
+         forwarder share one connection without racing on the catch-all:
+         each type lands in its own queue. Idempotent (re-registers return
+         the same queue).
+        """
+        with self._lock:
+            q = self._inbound.get(channel_type)
+            if q is None:
+                q = queue.Queue()
+                self._inbound[channel_type] = q
+            return q
+
+    def unregister_inbound(self, channel_type: bytes) -> None:
+        with self._lock:
+            self._inbound.pop(channel_type, None)
+
     def send(self, payload: bytes) -> None:
         self._t.send_packet(payload)
 
@@ -208,7 +234,7 @@ class ChannelMux:
                 return
             self._dead_err = err
             self._dead.set()
-            targets = list(self._queues.values()) + [self._catch]
+            targets = list(self._queues.values()) + [self._catch] + list(self._inbound.values())
         for q in targets:
             try:
                 q.put(_DEAD)
@@ -217,12 +243,25 @@ class ChannelMux:
 
     def _broadcast(self, p: bytes) -> None:
         with self._lock:
-            targets = list(self._queues.values()) + [self._catch]
+            targets = list(self._queues.values()) + [self._catch] + list(self._inbound.values())
         for q in targets:
             try:
                 q.put(p)
             except Exception:
                 pass
+
+    @staticmethod
+    def _open_type(p: bytes) -> bytes | None:
+        """Channel type of a CHANNEL_OPEN packet, or None if unparseable."""
+        if not p or p[0] != 90 or len(p) < 6:
+            return None
+        try:
+            ln = struct.unpack(">I", p[1:5])[0]
+            if ln == 0 or ln > 64 or 5 + ln > len(p):
+                return None
+            return bytes(p[5:5 + ln])
+        except Exception:
+            return None
 
     def _route(self, p: bytes) -> None:
         # NB: IGNORE/DEBUG/GLOBAL_REQUEST never reach here: the reader uses
@@ -246,8 +285,20 @@ class ChannelMux:
                     pass
             return
         if m == 90:
-            # Server-initiated open (forwarded-tcpip): p[1:5] is the type
-            # string length, NOT a channel id - always to catch-all.
+            # Server-initiated open: route by channel type when a dedicated
+            # inbound queue exists (x11 / auth-agent / forwarded-tcpip each
+            # get their own), else the historical catch-all. p[1:5] is the
+            # type string length, NOT a channel id.
+            ctype = self._open_type(p)
+            if ctype is not None:
+                with self._lock:
+                    q = self._inbound.get(ctype)
+                if q is not None:
+                    try:
+                        q.put(p)
+                    except Exception:
+                        pass
+                    return
             try:
                 self._catch.put(p)
             except Exception:

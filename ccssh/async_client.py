@@ -29,7 +29,11 @@ from ccssh.client import CCSSHClient as _SyncClient
 
 
 class AsyncCCSSHClient:
-    def __init__(self, *, timeout: float = 10.0, host_policy: str = "strict", known_hosts: str | None = None, kex: list[str] | None = None, ciphers: list[str] | None = None, macs: list[str] | None = None, hostkeys: list[str] | None = None, rekey_bytes: int = 4 * 1024**3, rekey_interval: float = 3600.0):
+    """Async SSH client (no port/X11/agent forwarding; sync has the mux)."""
+
+    def __init__(self, *, timeout: float = 10.0, host_policy: str = "strict", known_hosts: str | None = None, kex: list[str] | None = None, ciphers: list[str] | None = None, macs: list[str] | None = None, hostkeys: list[str] | None = None, rekey_bytes: int = 4 * 1024**3, rekey_interval: float = 3600.0, compression: bool | str | list[str] = False, compression_level: int = 6, use_agent: bool = True, agent_path: str | None = None):
+        from ccssh import compress as _comp_mod
+        _comp_mod.check_level(compression_level)
         self.timeout = timeout
         self.host_policy = host_policy
         self.known_hosts = os.path.expanduser(known_hosts) if known_hosts else None
@@ -37,6 +41,15 @@ class AsyncCCSSHClient:
         self.cipher_list = algs.normalize_list(algs.SUPPORTED_CIPHERS, ciphers) or CIPHER_DEFAULT
         self.mac_list = algs.normalize_list(algs.SUPPORTED_MACS, macs) or MAC_DEFAULT
         self.hostkey_list = algs.normalize_list(algs.SUPPORTED_HOSTKEYS, hostkeys) or HOSTKEY_DEFAULT
+        comp = algs.normalize_compression(compression)
+        self.comp_list = comp if comp is not None else algs.default_compression(False)
+        for _c in self.comp_list:
+            _comp_mod.check_name(_c)
+        if not self.comp_list:
+            raise ValueError("compression list is empty")
+        self.compression_level = compression_level
+        self.use_agent = use_agent
+        self.agent_path = os.path.expanduser(agent_path) if agent_path else None
         self.rekey_bytes = rekey_bytes
         self.rekey_interval = rekey_interval
         self._t: AsyncTransport | None = None
@@ -44,6 +57,8 @@ class AsyncCCSSHClient:
         self._cipher = "none"
         self._kex_name = "none"
         self._mac = "none"
+        self._comp_c2s = "none"
+        self._comp_s2c = "none"
         self._chan_next = 1
         self._strict = False
         self._host_Ks: bytes | None = None
@@ -52,6 +67,10 @@ class AsyncCCSSHClient:
         # each other's packets (same single-reader rule as the sync side
         # without a mux). Rekey takes the same lock.
         self._op_lock = asyncio.Lock()
+
+    def negotiated(self) -> dict[str, str]:
+        comp = self._comp_c2s if self._comp_c2s == self._comp_s2c else f"{self._comp_c2s}/{self._comp_s2c}"
+        return {"kex": self._kex_name, "cipher": self._cipher, "mac": self._mac, "compression": comp, "strict": str(self._strict)}
 
     async def _maybe_rekey(self) -> None:
         t = self._t
@@ -83,12 +102,16 @@ class AsyncCCSSHClient:
     async def _rekey_inner(self) -> None:
         t = self._t
         assert t is not None
-        our = K0.enc_kexinit(os.urandom(16), self.kex_list, self.hostkey_list, self.cipher_list, self.cipher_list, self.mac_list, self.mac_list, ["none"], ["none"])
+        our = K0.enc_kexinit(os.urandom(16), self.kex_list, self.hostkey_list, self.cipher_list, self.cipher_list, self.mac_list, self.mac_list, self.comp_list, self.comp_list)
         await t.send_packet(our)
         peer = K0.dec_kexinit(await t.recv_packet())
         kex_name = K0.negotiate(self.kex_list, peer["kex"])
         cipher = K0.negotiate_symmetric(self.cipher_list, peer["enc_c2s"], peer["enc_s2c"], "cipher")
         mac = K0.negotiate_symmetric(self.mac_list, peer["mac_c2s"], peer["mac_s2c"], "mac")
+        comp_c2s = K0.negotiate(self.comp_list, peer["comp_c2s"])
+        comp_s2c = K0.negotiate(self.comp_list, peer["comp_s2c"])
+        if (comp_c2s, comp_s2c) != (self._comp_c2s, self._comp_s2c):
+            raise CCSSHError(f"rekey must not change compression ({self._comp_c2s}/{self._comp_s2c} -> {comp_c2s}/{comp_s2c})")
         host_alg = K0.negotiate(self.hostkey_list, peer["hostkey"])
         Ic, Is = K0.I_FOR_H(our), K0.I_FOR_H(peer["payload_full"])
         await self._skip_unmatched_guess(t, peer, self.kex_list, kex_name)
@@ -111,18 +134,20 @@ class AsyncCCSSHClient:
         self._cipher, self._mac = cipher, mac
         self._kex_name = kex_name
 
-    async def connect(self, hostname: str, *, port: int = 22, username: str, password: str | None = None, key_filename: str | None = None, cert_filename: str | None = None, passphrase: str | None = None, family: int = 0, kbdint_responder: A.KbdintResponder | None = None) -> "AsyncCCSSHClient":
+    async def connect(self, hostname: str, *, port: int = 22, username: str, password: str | None = None, key_filename: str | None = None, cert_filename: str | None = None, passphrase: str | None = None, family: int = 0, kbdint_responder: A.KbdintResponder | None = None, use_agent: bool | None = None, agent_path: str | None = None) -> "AsyncCCSSHClient":
         reader, writer = await self._open(hostname, port, family)
         t = AsyncTransport(reader, writer, VERSION, timeout=self.timeout)
         Vs = await t.do_version()
         Vc = VERSION
-        our = K0.enc_kexinit(os.urandom(16), self.kex_list + [K0.KEX_STRICT_C, K0.EXT_INFO_C], self.hostkey_list, self.cipher_list, self.cipher_list, self.mac_list, self.mac_list, ["none"], ["none"])
+        our = K0.enc_kexinit(os.urandom(16), self.kex_list + [K0.KEX_STRICT_C, K0.EXT_INFO_C], self.hostkey_list, self.cipher_list, self.cipher_list, self.mac_list, self.mac_list, self.comp_list, self.comp_list)
         await t.send_packet(our)
         peer = K0.dec_kexinit(await t.recv_packet())
         kex_name = K0.negotiate(self.kex_list, peer["kex"])
         host_alg = K0.negotiate(self.hostkey_list, peer["hostkey"])
         cipher = K0.negotiate_symmetric(self.cipher_list, peer["enc_c2s"], peer["enc_s2c"], "cipher")
         mac = K0.negotiate_symmetric(self.mac_list, peer["mac_c2s"], peer["mac_s2c"], "mac")
+        comp_c2s = K0.negotiate(self.comp_list, peer["comp_c2s"])
+        comp_s2c = K0.negotiate(self.comp_list, peer["comp_s2c"])
         Ic, Is = K0.I_FOR_H(our), K0.I_FOR_H(peer["payload_full"])
         await self._skip_unmatched_guess(t, peer, self.kex_list, kex_name)
         K_enc, Hh, Ks, hashfn = await self._kex(t, kex_name, Vc, Vs, Ic, Is, host_alg)
@@ -132,6 +157,7 @@ class AsyncCCSSHClient:
             raise HostKeyError(str(e)) from e
         keys = _SyncClient._derive(cipher, mac, K_enc, Hh, hashfn)
         t.activate(keys, cipher, mac, is_client=True)
+        t.set_compression(comp_c2s, comp_s2c, self.compression_level)
         await t.send_packet(bytes([K0.MSG_NEWKEYS]))
         t._enc_on_send = True
         if (await t.recv_packet() or b"\x00")[0] != K0.MSG_NEWKEYS:
@@ -142,6 +168,9 @@ class AsyncCCSSHClient:
             t.send_seq = 0
             t.recv_seq = 0
         self._t, self._sid = t, Hh
+        self._cipher, self._mac = cipher, mac
+        self._kex_name = kex_name
+        self._comp_c2s, self._comp_s2c = comp_c2s, comp_s2c
         self._host_Ks = Ks
         await t.send_packet(A.enc_service_request())
         for _ in range(16): # EXT_INFO repeats are skipped, not fatal
@@ -153,18 +182,77 @@ class AsyncCCSSHClient:
             raise CCSSHError("no ssh-userauth service")
         if key_filename or cert_filename:
             await self._auth_pubkey(username, key_filename, cert_filename, passphrase)
-        elif password is not None:
-            await t.send_packet(A.enc_password_request(username, password))
-            if (await t.recv_packet() or b"\x00")[0] != A.MSG_USERAUTH_SUCCESS:
-                try:
-                    await self._auth_kbdint(username, lambda prompts: [password] * len(prompts))
-                except AuthError:
-                    raise AuthError("password rejected") from None
-        elif kbdint_responder is not None:
-            await self._auth_kbdint(username, kbdint_responder)
         else:
-            raise AuthError("provide password or key_filename")
+            _agent_ok = False
+            _agent_err: Exception | None = None
+            _want_agent = self.use_agent if use_agent is None else use_agent
+            _agent_sock = agent_path if agent_path is not None else self.agent_path
+            if _want_agent:
+                try:
+                    await self._auth_agent(username, _agent_sock)
+                    _agent_ok = True
+                except AuthError as e:
+                    _agent_err = e
+            if not _agent_ok:
+                if password is not None:
+                    await t.send_packet(A.enc_password_request(username, password))
+                    if (await t.recv_packet() or b"\x00")[0] != A.MSG_USERAUTH_SUCCESS:
+                        try:
+                            await self._auth_kbdint(username, lambda prompts: [password] * len(prompts))
+                        except AuthError:
+                            raise AuthError("password rejected") from None
+                elif kbdint_responder is not None:
+                    await self._auth_kbdint(username, kbdint_responder)
+                elif _agent_err is not None:
+                    raise _agent_err
+                else:
+                    raise AuthError("provide password, key_filename or an agent key")
+        t.enable_delayed_compression()
         return self
+
+    async def _auth_agent(self, username: str, agent_path: str | None = None) -> None:
+        """Agent publickey auth (sync twin; local socket is fast)."""
+        from ccssh import agent as _AG
+        from ccssh import hostkeys as _HK
+        t = self._t
+        if t is None or self._sid is None:
+            raise CCSSHError("call .connect() first")
+        try:
+            ac = _AG.AgentClient(agent_path, timeout=self.timeout)
+        except _AG.AgentError as e:
+            raise AuthError(f"agent unavailable: {e}") from e
+        try:
+            identities = ac.list_identities()
+        except _AG.AgentError as e:
+            raise AuthError(f"agent failed: {e}") from e
+        if not identities:
+            raise AuthError("agent has no identities")
+        last: Exception | None = None
+        for blob, comment in identities:
+            try:
+                inner_alg, _ = _HK.parse_host_blob(blob)
+            except Exception as e:
+                last = e
+                continue
+            alg = b"rsa-sha2-256" if inner_alg == "ssh-rsa" else inner_alg.encode()
+            await t.send_packet(A.enc_pubkey_probe(username, alg, blob))
+            r = await t.recv_packet()
+            if r and r[0] == A.MSG_USERAUTH_SUCCESS:
+                return
+            if r and r[0] != A.MSG_USERAUTH_PK_OK:
+                pass  # try signed anyway (same rule as sync)
+            assert self._sid is not None
+            data = A.auth_sign_blob(self._sid, username, alg, blob)
+            try:
+                outer = ac.sign(blob, data, _AG.sign_flags_for_alg(alg.decode()))
+            except _AG.AgentError as e:
+                last = e
+                continue
+            await t.send_packet(A.enc_pubkey_signed(username, alg, blob, outer))
+            if (await t.recv_packet() or b"\x00")[0] == A.MSG_USERAUTH_SUCCESS:
+                return
+            last = AuthError(f"agent key {comment or inner_alg} rejected")
+        raise AuthError(f"agent keys rejected ({last})" if last else "agent keys rejected")
 
     async def _open(self, hostname: str, port: int, family: int):
         """

@@ -1,10 +1,11 @@
 """
  Synchronous SSH client over the native ccssh transport.
 
- Supports password, publickey (ed25519 / ecdsa / rsa / mldsa44-ed25519),
- OpenSSH certificates, custom ports, exec channels, SFTP subsystem,
- local forwarding, manual/auto rekey, and strict/accept-new/off host-key
- policies.
+ Supports password, publickey (ed25519 / ecdsa / rsa / mldsa44-ed25519,
+ including ssh-agent keys), OpenSSH certificates, custom ports, exec
+ channels, SFTP subsystem, local/dynamic/remote forwarding, X11 and
+ agent forwarding, manual/auto rekey, compression (zlib@openssh.com /
+ zlib, like `ssh -C`), and strict/accept-new/off host-key policies.
 """
 from __future__ import annotations
 import base64
@@ -257,9 +258,11 @@ class ShellSession:
 
 
 class CCSSHClient:
-    def __init__(self, *, timeout: float = 10.0, known_hosts: str | list[str] | None = None, host_policy: str = "strict", kex: list[str] | None = None, ciphers: list[str] | None = None, macs: list[str] | None = None, hostkeys: list[str] | None = None, rekey_bytes: int = 4 * 1024**3, rekey_interval: float = 3600.0, verbose: int = 0, ask_callback=None):
+    def __init__(self, *, timeout: float = 10.0, known_hosts: str | list[str] | None = None, host_policy: str = "strict", kex: list[str] | None = None, ciphers: list[str] | None = None, macs: list[str] | None = None, hostkeys: list[str] | None = None, rekey_bytes: int = 4 * 1024**3, rekey_interval: float = 3600.0, verbose: int = 0, ask_callback=None, compression: bool | str | list[str] = False, compression_level: int = 6, use_agent: bool = True, agent_path: str | None = None):
         if host_policy not in ("strict", "accept-new", "ask", "off"):
             raise ValueError(f"bad host_policy {host_policy!r} (must be strict|accept-new|ask|off)")
+        from ccssh import compress as _comp_mod
+        _comp_mod.check_level(compression_level)
         self.timeout = timeout
         self.known_hosts = [os.path.expanduser(p) for p in known_hosts] if isinstance(known_hosts, list) else (os.path.expanduser(known_hosts) if known_hosts else None)
         self.host_policy = host_policy
@@ -268,19 +271,32 @@ class CCSSHClient:
         self.cipher_list = algs.normalize_list(algs.SUPPORTED_CIPHERS, ciphers) or CIPHER_DEFAULT
         self.mac_list = algs.normalize_list(algs.SUPPORTED_MACS, macs) or MAC_DEFAULT
         self.hostkey_list = algs.normalize_list(algs.SUPPORTED_HOSTKEYS, hostkeys) or HOSTKEY_DEFAULT
+        comp = algs.normalize_compression(compression)
+        self.comp_list = comp if comp is not None else algs.default_compression(False)
+        self.compression_level = compression_level
+        # Validate every offered name now (fail fast on typos like "zlip").
+        for _c in self.comp_list:
+            _comp_mod.check_name(_c)
+        if not self.comp_list:
+            raise ValueError("compression list is empty")
         self.rekey_bytes = rekey_bytes
         self.rekey_interval = rekey_interval
         self.verbose = verbose
+        self.use_agent = use_agent
+        self.agent_path = os.path.expanduser(agent_path) if agent_path else None
         self._t: SyncTransport | None = None
         self._sid: bytes | None = None
         self._cipher = "none"
         self._kex = "none"
         self._mac = "none"
+        self._comp_c2s = "none"
+        self._comp_s2c = "none"
         self._strict = False
         self._chan_next = 1
         self._chan_lock = threading.Lock()
         self._open_chans: set[int] = set()  # channels needing mux queues
-        self._fwds: list = []
+        self._fwds: list = []  # the single active *port* forwarder (-L/-R/-D)
+        self._aux_fwds: list = []  # agent + x11 forwarders (coexist freely)
         self._host_Ks: bytes | None = None
         self._host_alg = "unknown"
         self._mux = None  # ChannelMux once forwarding shares this connection
@@ -324,7 +340,7 @@ class CCSSHClient:
         if guess != kex_name:
             t.recv_packet() # discard the decoy
 
-    def connect(self, hostname: str, *, port: int = 22, username: str, password: str | None = None, key_filename: str | None = None, cert_filename: str | None = None, passphrase: str | None = None, family: int = 0, sock: _chansock_mod.StreamSocket | None = None, kbdint_responder: A.KbdintResponder | None = None) -> "CCSSHClient":
+    def connect(self, hostname: str, *, port: int = 22, username: str, password: str | None = None, key_filename: str | None = None, cert_filename: str | None = None, passphrase: str | None = None, family: int = 0, sock: _chansock_mod.StreamSocket | None = None, kbdint_responder: A.KbdintResponder | None = None, use_agent: bool | None = None, agent_path: str | None = None) -> "CCSSHClient":
         owned = sock is None  # dialled here (closable) vs jump-owned (hands off)
         # A previous connection's mux (if any) belongs to its transport:
         # never let a stale reader steal the new handshake.
@@ -377,17 +393,24 @@ class CCSSHClient:
             Vc = VERSION
             self._log(2, f"KEX offer: kex={self.kex_list}")
             self._log(2, f"KEX offer: hostkey={self.hostkey_list} cipher={self.cipher_list} mac={self.mac_list}")
-            our = K0.enc_kexinit(os.urandom(16), self.kex_list + [K0.KEX_STRICT_C, K0.EXT_INFO_C], self.hostkey_list, self.cipher_list, self.cipher_list, self.mac_list, self.mac_list, ["none"], ["none"])
+            self._log(2, f"KEX offer: compression={self.comp_list} level={self.compression_level}")
+            our = K0.enc_kexinit(os.urandom(16), self.kex_list + [K0.KEX_STRICT_C, K0.EXT_INFO_C], self.hostkey_list, self.cipher_list, self.cipher_list, self.mac_list, self.mac_list, self.comp_list, self.comp_list)
             t.send_packet(our)  # still plaintext at this point
             peer_raw = t.recv_packet()
             peer = K0.dec_kexinit(peer_raw)
             self._log(2, f"peer KEX: kex={peer['kex']} hostkey={peer['hostkey']} cipher_c2s={peer['enc_c2s']} mac_c2s={peer['mac_c2s']}")
+            self._log(2, f"peer KEX: comp_c2s={peer['comp_c2s']} comp_s2c={peer['comp_s2c']}")
             kex_name = K0.negotiate(self.kex_list, peer["kex"])
             host_alg = K0.negotiate(self.hostkey_list, peer["hostkey"])
             cipher = K0.negotiate_symmetric(self.cipher_list, peer["enc_c2s"], peer["enc_s2c"], "cipher")
             mac = K0.negotiate_symmetric(self.mac_list, peer["mac_c2s"], peer["mac_s2c"], "mac")
+            # RFC 4253 7.1 allows independent compression per direction
+            # (OpenSSH negotiates ctos/stoc separately); in practice both
+            # sides offer the same list, so both directions agree.
+            comp_c2s = K0.negotiate(self.comp_list, peer["comp_c2s"])
+            comp_s2c = K0.negotiate(self.comp_list, peer["comp_s2c"])
             strict = K0.peer_wants_strict(peer["kex"], is_client=True)
-            self._log(1, f"kex: {kex_name} hostkey: {host_alg} cipher: {cipher} mac: {mac} strict: {strict}")
+            self._log(1, f"kex: {kex_name} hostkey: {host_alg} cipher: {cipher} mac: {mac} comp: {comp_c2s}/{comp_s2c} strict: {strict}")
             Ic, Is = K0.I_FOR_H(our), K0.I_FOR_H(peer["payload_full"])
             self._skip_unmatched_guess(t, peer, self.kex_list, kex_name)
             self._log(2, "running KEX ...")
@@ -403,6 +426,7 @@ class CCSSHClient:
             self._host_alg = host_alg
             keys = self._derive(cipher, mac, K_enc, Hh, hashfn)
             t.activate(keys, cipher, mac, is_client=True)
+            t.set_compression(comp_c2s, comp_s2c, self.compression_level)
             t.send_packet(bytes([K0.MSG_NEWKEYS]))  # old (plaintext) keys
             t._enc_on_send = True
             pkt = t.recv_packet()
@@ -415,7 +439,8 @@ class CCSSHClient:
                 t.recv_seq = 0
             self._t, self._sid, self._cipher, self._mac = t, Hh, cipher, mac
             self._kex = kex_name
-            self._log(1, f"negotiated: kex={kex_name} cipher={cipher} mac={mac} strict={self._strict}")
+            self._comp_c2s, self._comp_s2c = comp_c2s, comp_s2c
+            self._log(1, f"negotiated: kex={kex_name} cipher={cipher} mac={mac} comp={comp_c2s}/{comp_s2c} strict={self._strict}")
             self._log(2, f"session id: {Hh.hex()[:32]}...")
             t.send_packet(A.enc_service_request())
             for _ in range(16): # EXT_INFO repeats are skipped, not fatal
@@ -431,24 +456,50 @@ class CCSSHClient:
                 self._log(1, f"auth: publickey key={key_filename} cert={cert_filename}")
                 self._auth_pubkey(username, key_filename, cert_filename, passphrase)
                 self._log(1, "auth: publickey accepted")
-            elif password is not None:
-                self._log(1, "auth: password method")
-                t.send_packet(A.enc_password_request(username, password))
-                if (t.recv_packet() or b"\x00")[0] != A.MSG_USERAUTH_SUCCESS:
-                    # Fall back to keyboard-interactive (RFC 4256) with the
-                    # same secret: servers like serveo.net only offer that
-                    # method. The original error is kept if it fails too.
-                    self._log(1, "auth: password rejected, trying keyboard-interactive")
-                    try:
-                        self._auth_kbdint(username, lambda prompts: [password] * len(prompts))
-                    except AuthError:
-                        raise AuthError("password rejected") from None
-                else:
-                    self._log(1, "auth: password accepted")
-            elif kbdint_responder is not None:
-                self._auth_kbdint(username, kbdint_responder)
             else:
-                raise AuthError("provide password or key_filename")
+                # Publickey via ssh-agent first (like OpenSSH, which tries
+                # agent + file keys before keyboard-interactive/password).
+                # An agent failure falls through to the next method on this
+                # same connection; only the last error is reported.
+                _agent_ok = False
+                _agent_err: Exception | None = None
+                _want_agent = self.use_agent if use_agent is None else use_agent
+                _agent_sock = agent_path if agent_path is not None else self.agent_path
+                if _want_agent:
+                    try:
+                        self._auth_agent(username, _agent_sock)
+                        _agent_ok = True
+                        self._log(1, "auth: agent key accepted")
+                    except AuthError as e:
+                        _agent_err = e
+                        self._log(2, f"auth: agent skipped/failed ({e})")
+                if not _agent_ok:
+                    if password is not None:
+                        self._log(1, "auth: password method")
+                        t.send_packet(A.enc_password_request(username, password))
+                        if (t.recv_packet() or b"\x00")[0] != A.MSG_USERAUTH_SUCCESS:
+                            # Fall back to keyboard-interactive (RFC 4256) with the
+                            # same secret: servers like serveo.net only offer that
+                            # method. The original error is kept if it fails too.
+                            self._log(1, "auth: password rejected, trying keyboard-interactive")
+                            try:
+                                self._auth_kbdint(username, lambda prompts: [password] * len(prompts))
+                            except AuthError:
+                                raise AuthError("password rejected") from None
+                        else:
+                            self._log(1, "auth: password accepted")
+                    elif kbdint_responder is not None:
+                        self._auth_kbdint(username, kbdint_responder)
+                    elif _agent_err is not None:
+                        raise _agent_err
+                    else:
+                        raise AuthError("provide password, key_filename or an agent key")
+            # Delayed compression starts only now (after USERAUTH_SUCCESS),
+            # exactly like OpenSSH: "zlib" directions are already running
+            # (since NEWKEYS), "none" stays off, delayed turns on here.
+            t.enable_delayed_compression()
+            if self._comp_c2s != "none" or self._comp_s2c != "none":
+                self._log(1, f"compression enabled: {self._comp_c2s}/{self._comp_s2c} level={self.compression_level}")
         except Exception:
             # An externally owned jump socket (sock=) stays open for the
             # caller to reuse; only a socket we dialled ourselves is closed.
@@ -561,6 +612,68 @@ class CCSSHClient:
             self._log(1, f"auth: publickey key={key_path} rejected by server")
             raise AuthError("publickey rejected")
         self._log(1, f"auth: publickey key={key_path} accepted")
+
+    def _auth_agent(self, username: str, agent_path: str | None = None) -> None:
+        """
+         Publickey auth with ssh-agent keys (RFC 9987 agent protocol).
+
+         Lists identities from the local agent and tries each in turn on
+         this same connection (probe, then agent-side signature). Raises
+         AuthError when there is no agent, no keys, or the server rejects
+         them all (the caller falls through to the next auth method).
+        """
+        from ccssh import agent as _AG
+        if not self._t or self._sid is None:
+            raise CCSSHError("call .connect() first")
+        try:
+            ac = _AG.AgentClient(agent_path, timeout=self.timeout)
+        except _AG.AgentError as e:
+            raise AuthError(f"agent unavailable: {e}") from e
+        try:
+            identities = ac.list_identities()
+        except _AG.AgentError as e:
+            raise AuthError(f"agent failed: {e}") from e
+        if not identities:
+            raise AuthError("agent has no identities")
+        self._log(2, f"auth: agent {ac.path} offers {len(identities)} key(s)")
+        last: Exception | None = None
+        for blob, comment in identities:
+            try:
+                inner_alg, _ = HK.parse_host_blob(blob)
+            except Exception as e:
+                self._log(2, f"auth: agent key {comment!r} unparseable, skipping")
+                last = e
+                continue
+            # RSA blobs always negotiate as rsa-sha2-256 here (same rule as
+            # file keys in _user_blob); certs pass through with their type.
+            if inner_alg == "ssh-rsa":
+                alg = b"rsa-sha2-256"
+            else:
+                alg = inner_alg.encode()
+            label = comment or inner_alg
+            self._log(1, f"auth: agent probe {inner_alg} ({label})")
+            assert self._t is not None and self._sid is not None
+            self._t.send_packet(A.enc_pubkey_probe(username, alg, blob))
+            r = self._t.recv_packet()
+            if r and r[0] == A.MSG_USERAUTH_SUCCESS:
+                self._log(1, f"auth: server accepted agent key {label} without signature")
+                return
+            if r and r[0] != A.MSG_USERAUTH_PK_OK:
+                self._log(2, f"auth: agent probe answered {(r[0] if r else None)}, trying signed anyway")
+            data = A.auth_sign_blob(self._sid, username, alg, blob)
+            try:
+                outer = ac.sign(blob, data, _AG.sign_flags_for_alg(alg.decode()))
+            except _AG.AgentError as e:
+                self._log(2, f"auth: agent refused to sign with {label} ({e})")
+                last = e
+                continue
+            self._t.send_packet(A.enc_pubkey_signed(username, alg, blob, outer))
+            if (self._t.recv_packet() or b"\x00")[0] == A.MSG_USERAUTH_SUCCESS:
+                self._log(1, f"auth: agent key {label} accepted")
+                return
+            self._log(2, f"auth: agent key {label} rejected by server")
+            last = AuthError(f"agent key {label} rejected")
+        raise AuthError(f"agent keys rejected ({last})" if last else "agent keys rejected")
     def _auth_kbdint(self, username: str, responder: A.KbdintResponder) -> None:
         """Keyboard-interactive auth (RFC 4256): probe, answer each
         INFO_REQUEST via `responder`, stop at SUCCESS/FAILURE. Bounded
@@ -675,9 +788,14 @@ class CCSSHClient:
                 pass
 
     def exec_command(self, command: str, *, timeout: float | None = None,
-                       max_bytes: int = 16 * 1024 * 1024, raw_bytes: bool = False):
+                       max_bytes: int = 16 * 1024 * 1024, raw_bytes: bool = False,
+                       forward_agent: bool = False, x11: bool = False,
+                       x11_trusted: bool = False, agent_path: str | None = None,
+                       x11_display: str | None = None):
         """Run one command. Returns (stdout, stderr, exit_status) as text,
-        or as bytes with raw_bytes=True (binary-safe, like ssh pipes)."""
+        or as bytes with raw_bytes=True (binary-safe, like ssh pipes).
+        `forward_agent` (`ssh -A`) and `x11` (`ssh -X`/`-Y`) request
+        session forwarding first (refusals are tolerated with a warning)."""
         if not self._t:
             raise CCSSHError("call .connect() first")
         self._maybe_rekey()
@@ -685,14 +803,17 @@ class CCSSHClient:
         chan = self._alloc_chan()
         self._reg(chan)
         try:
-            out_b, err_b, code = self._exec_inner(t, chan, command, max_bytes)
+            out_b, err_b, code = self._exec_inner(
+                t, chan, command, max_bytes, forward_agent=forward_agent,
+                x11=x11, x11_trusted=x11_trusted, agent_path=agent_path,
+                x11_display=x11_display)
         finally:
             self._unreg(chan)
         if raw_bytes:
             return out_b, err_b, code
         return out_b.decode(errors="replace"), err_b.decode(errors="replace"), code
 
-    def _exec_inner(self, t, chan: int, command: str, max_bytes: int) -> tuple[bytes, bytes, int]:
+    def _exec_inner(self, t, chan: int, command: str, max_bytes: int, *, forward_agent: bool = False, x11: bool = False, x11_trusted: bool = False, agent_path: str | None = None, x11_display: str | None = None) -> tuple[bytes, bytes, int]:
         self._log(2, f"exec: opening session channel {chan} for {command!r:.80}")
         t.send_packet(CH.enc_open_session(chan))
         while True:
@@ -706,6 +827,21 @@ class CCSSHClient:
         if r.u32() != chan:
             raise CCSSHError("channel confirm for foreign channel")
         srv = r.u32()
+        # Session forwarding requests precede exec (same order as open_shell).
+        sess = ShellSession(self, srv, 0, CH.MAXPKT, chan=chan)
+        if forward_agent:
+            self._send_request(chan, CH.enc_agent_req(srv))
+            if not self._await_request(sess, "auth-agent-req@openssh.com"):
+                self._log(1, "auth-agent-req refused by server (continuing without agent forwarding)")
+        if x11:
+            from ccssh import x11 as _X11
+            fwd = self._ensure_x11_fwd(x11_display)
+            if not fwd.display_ok:
+                self._log(1, "x11: no usable local DISPLAY; using fake cookie "
+                             "(inbound X connections will be refused)")
+            self._send_request(chan, _X11.enc_x11_req(srv, cookie=fwd.cookie, screen=fwd.screen))
+            if not self._await_request(sess, "x11-req"):
+                self._log(1, "x11-req refused by server (continuing without X11 forwarding)")
         self._send_request(chan, CH.enc_exec(srv, command))
         while True:
             pkt = self._rx(chan) or b"\x00"
@@ -848,7 +984,7 @@ class CCSSHClient:
                 raise CCSSHError("peer started rekey with an open channel: close channels and call rekey()")
             continue
 
-    def open_shell(self, *, term: str | None = None, cols: int = 80, rows: int = 24, pty: bool = True, command: str | None = None) -> "ShellSession":
+    def open_shell(self, *, term: str | None = None, cols: int = 80, rows: int = 24, pty: bool = True, command: str | None = None, forward_agent: bool = False, x11: bool = False, x11_trusted: bool = False, agent_path: str | None = None, x11_display: str | None = None) -> "ShellSession":
         """
          Open a session channel with shell (RFC 4254 6.5), with pty
          (RFC 4254 6.2) unless pty=False (`ssh -T`).
@@ -857,6 +993,10 @@ class CCSSHClient:
          (`ssh -t host command`). Returns a ShellSession for interactive
          use (see ccssh.shell). A refused pty is tolerated (shell continues
          without a terminal); a refused shell/exec raises CCSSHError.
+         `forward_agent=True` (`ssh -A`) and `x11=True` (`ssh -X`, or
+         trusted with `x11_trusted=True` for `ssh -Y`) send the matching
+         session requests first; a refused agent/x11 request is tolerated
+         with a warning (like a refused pty), never fatal to the login.
          Like exec, no rekey is possible while the channel is open - call
          between sessions.
         """
@@ -868,6 +1008,10 @@ class CCSSHClient:
                 sess.no_pty = True  # degraded but usable (no job control)
         else:
             sess.no_pty = True
+        if forward_agent:
+            self._request_agent_forwarding(sess, _chan, srv, agent_path)
+        if x11:
+            self._request_x11(sess, _chan, srv, trusted=x11_trusted, display=x11_display)
         if command is not None:
             self._send_request(_chan, CH.enc_exec(srv, command))
             if not self._await_request(sess, "exec"):
@@ -877,6 +1021,24 @@ class CCSSHClient:
             if not self._await_request(sess, "shell"):
                 raise CCSSHError("shell refused by server")
         return sess
+
+    def _request_agent_forwarding(self, sess: "ShellSession", chan: int, srv: int, agent_path: str | None = None) -> None:
+        """Send auth-agent-req and start the relay (tolerates refusal)."""
+        self._ensure_agent_fwd(agent_path)
+        self._send_request(chan, CH.enc_agent_req(srv))
+        if not self._await_request(sess, "auth-agent-req@openssh.com"):
+            self._log(1, "auth-agent-req refused by server (continuing without agent forwarding)")
+
+    def _request_x11(self, sess: "ShellSession", chan: int, srv: int, *, trusted: bool = False, display: str | None = None) -> None:
+        """Send x11-req and start the relay (tolerates refusal)."""
+        from ccssh import x11 as _X11
+        fwd = self._ensure_x11_fwd(display)
+        if not fwd.display_ok:
+            self._log(1, "x11: no usable local DISPLAY; using fake cookie "
+                         "(inbound X connections will be refused)")
+        self._send_request(chan, _X11.enc_x11_req(srv, cookie=fwd.cookie, screen=fwd.screen))
+        if not self._await_request(sess, "x11-req"):
+            self._log(1, "x11-req refused by server (continuing without X11 forwarding)")
 
     def open_channel_socket(self, host: str, port: int, *, orig_host: str = "127.0.0.1", orig_port: int = 0) -> "_chansock_mod.ChannelSocket":
         """
@@ -1095,18 +1257,32 @@ class CCSSHClient:
         return sc
 
     def negotiated(self) -> dict[str, str]:
-        return {"kex": self._kex, "cipher": self._cipher, "mac": self._mac, "strict": str(self._strict), "hostkey": getattr(self, "_host_alg", "unknown")}
+        comp = self._comp_c2s if self._comp_c2s == self._comp_s2c else f"{self._comp_c2s}/{self._comp_s2c}"
+        return {"kex": self._kex, "cipher": self._cipher, "mac": self._mac, "compression": comp, "strict": str(self._strict), "hostkey": getattr(self, "_host_alg", "unknown")}
 
     def _claim_forwarder(self, fwd):
         """
-         Only one active forwarder per connection (kept as a deliberate
-         v1 limit even though the mux could share more: two pumps would
-         still split server-initiated opens ambiguously).
+         Only one active *port* forwarder per connection (-L/-R/-D share the
+         slot: two listener pumps would still split server-initiated opens
+         ambiguously without typed routing on the dial side).
+
+         Agent and X11 forwarders live in _aux_fwds and coexist freely
+         (typed mux queues keep their opens apart).
         """
         self._fwds = [f for f in self._fwds if not f.closed]
         if self._fwds:
             raise CCSSHError("only one active forwarder per connection")
         self._fwds.append(fwd)
+        return fwd
+
+    def _claim_aux(self, kind: str, fwd):
+        """Register an agent/x11 forwarder (one of each kind at most)."""
+        self._aux_fwds = [f for f in self._aux_fwds if not f.closed]
+        for f in self._aux_fwds:
+            if getattr(f, "_aux_kind", None) == kind and not f.closed:
+                raise CCSSHError(f"{kind} forwarding already active on this connection")
+        fwd._aux_kind = kind
+        self._aux_fwds.append(fwd)
         return fwd
 
     def forward_local(self, lport: int, rhost: str, rport: int, bind: str = "127.0.0.1"):
@@ -1141,13 +1317,83 @@ class CCSSHClient:
         return self._claim_forwarder(
             _forward_mod.RemoteForwarder(mux, sport, rhost, rport, bind=bind).start())
 
+    def forward_dynamic(self, lport: int, bind: str = "127.0.0.1"):
+        """
+         Dynamic forwarding (`ssh -D`) in a background daemon thread: a
+         local SOCKS4/4a/5 proxy; each CONNECT becomes a direct-tcpip
+         channel through the server. Shares the connection through the
+         multiplexer. Returns the DynamicForwarder (.port, .close()).
+         Shares the single port-forwarder slot with -L/-R.
+        """
+        if not self._t:
+            raise CCSSHError("call .connect() first")
+        mux = self._ensure_mux()
+        self._log(1, f"forward: -D {bind}:{lport} (socks, mux shared)")
+        return self._claim_forwarder(
+            _forward_mod.DynamicForwarder(mux, lport, bind=bind).start())
+
+    def forward_agent(self, agent_path: str | None = None):
+        """
+         Agent forwarding (`ssh -A`): relay server-opened
+         auth-agent@openssh.com channels to the local agent. Use together
+         with open_shell(forward_agent=True) / exec_command(forward_agent=True),
+         which send the session request (or pass agent_path per session).
+         Returns the AgentForwarder (.close()).
+        """
+        if not self._t:
+            raise CCSSHError("call .connect() first")
+        mux = self._ensure_mux()
+        self._log(1, "forward: agent forwarding enabled (mux shared)")
+        return self._claim_aux(
+            "agent", _forward_mod.AgentForwarder(mux, agent_path).start())
+
+    def forward_x11(self, display: str | None = None, trusted: bool = False):
+        """
+         X11 forwarding (`ssh -X` / `ssh -Y` with trusted=True): relay
+         server-opened x11 channels to the local X display. Use together
+         with open_shell(x11=True) / exec_command(x11=True), which send
+         x11-req with this forwarder's cookie. Returns the X11Forwarder
+         (.cookie/.screen/.close()).
+        """
+        if not self._t:
+            raise CCSSHError("call .connect() first")
+        mux = self._ensure_mux()
+        self._log(1, f"forward: x11 forwarding enabled (trusted={trusted}, mux shared)")
+        return self._claim_aux(
+            "x11", _forward_mod.X11Forwarder(mux, display).start())
+
+    def _ensure_agent_fwd(self, agent_path: str | None = None):
+        """Existing active agent forwarder, or start one (for sessions)."""
+        self._aux_fwds = [f for f in self._aux_fwds if not f.closed]
+        for f in self._aux_fwds:
+            if getattr(f, "_aux_kind", None) == "agent" and not f.closed:
+                return f
+        if not self._t:
+            raise CCSSHError("call .connect() first")
+        mux = self._ensure_mux()
+        return self._claim_aux(
+            "agent", _forward_mod.AgentForwarder(mux, agent_path).start())
+
+    def _ensure_x11_fwd(self, display: str | None = None):
+        """Existing active x11 forwarder, or start one (for sessions)."""
+        self._aux_fwds = [f for f in self._aux_fwds if not f.closed]
+        for f in self._aux_fwds:
+            if getattr(f, "_aux_kind", None) == "x11" and not f.closed:
+                return f
+        if not self._t:
+            raise CCSSHError("call .connect() first")
+        mux = self._ensure_mux()
+        return self._claim_aux(
+            "x11", _forward_mod.X11Forwarder(mux, display).start())
+
     def rekey(self) -> None:
         """
          Re-run KEX over the connection. session_id is kept, seq reset.
 
          Call only with no open channels (between exec calls, forwarders
          closed). Strict-kex and ext-info markers are NOT repeated
-         (Terrapin rule); no EXT_INFO wait.
+         (Terrapin rule); no EXT_INFO wait. Compression stays as
+         negotiated (delayed streams get fresh dictionaries, like OpenSSH).
         """
         if not self._t or not self._sid:
             raise CCSSHError("call .connect() first")
@@ -1164,12 +1410,20 @@ class CCSSHClient:
             # reads or sends meanwhile.
             mux.pause()
         try:
-            our = K0.enc_kexinit(os.urandom(16), self.kex_list, self.hostkey_list, self.cipher_list, self.cipher_list, self.mac_list, self.mac_list, ["none"], ["none"])
+            our = K0.enc_kexinit(os.urandom(16), self.kex_list, self.hostkey_list, self.cipher_list, self.cipher_list, self.mac_list, self.mac_list, self.comp_list, self.comp_list)
             t.send_packet(our)
             peer = K0.dec_kexinit(t.recv_packet())
             kex_name = K0.negotiate(self.kex_list, peer["kex"])
             cipher = K0.negotiate_symmetric(self.cipher_list, peer["enc_c2s"], peer["enc_s2c"], "cipher")
             mac = K0.negotiate_symmetric(self.mac_list, peer["mac_c2s"], peer["mac_s2c"], "mac")
+            comp_c2s = K0.negotiate(self.comp_list, peer["comp_c2s"])
+            comp_s2c = K0.negotiate(self.comp_list, peer["comp_s2c"])
+            # Compression must not silently change kind mid-session in a way
+            # that desyncs the streams: only allow staying on the same
+            # methods (OpenSSH keeps compression enabled across rekeys).
+            if (comp_c2s, comp_s2c) != (self._comp_c2s, self._comp_s2c):
+                raise CCSSHError(f"rekey must not change compression "
+                                 f"({self._comp_c2s}/{self._comp_s2c} -> {comp_c2s}/{comp_s2c})")
             host_alg = K0.negotiate(self.hostkey_list, peer["hostkey"])
             Ic, Is = K0.I_FOR_H(our), K0.I_FOR_H(peer["payload_full"])
             self._skip_unmatched_guess(t, peer, self.kex_list, kex_name)
@@ -1192,7 +1446,7 @@ class CCSSHClient:
             t._enc_on_recv = True
             self._cipher, self._mac = cipher, mac
             self._kex = kex_name
-            self._log(1, f"rekey: done kex={kex_name} cipher={cipher} mac={mac}")
+            self._log(1, f"rekey: done kex={kex_name} cipher={cipher} mac={mac} comp={comp_c2s}/{comp_s2c}")
         finally:
             if mux is not None:
                 try:
@@ -1201,7 +1455,7 @@ class CCSSHClient:
                     pass
 
     def close(self) -> None:
-        for f in list(self._fwds):
+        for f in list(self._fwds) + list(self._aux_fwds):
             try:
                 f.close()
             except Exception:
@@ -1213,6 +1467,7 @@ class CCSSHClient:
             except Exception:
                 pass
         self._fwds = []
+        self._aux_fwds = []
         try:
             if self._t:
                 try:

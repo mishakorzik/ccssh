@@ -122,3 +122,23 @@ def check_window(window: int, delta: int) -> int:
 
 def enc_close(recipient: int) -> bytes:
     return bytes([MSG_CHANNEL_CLOSE]) + W.enc_u32(recipient)
+
+
+def enc_open_confirm(recipient: int, sender: int, window: int = WINDOW, maxpacket: int = MAXPKT) -> bytes:
+    """Generic CHANNEL_OPEN_CONFIRMATION (used for server-initiated opens)."""
+    return (bytes([MSG_CHANNEL_OPEN_CONFIRM]) + W.enc_u32(recipient)
+            + W.enc_u32(sender) + W.enc_u32(window) + W.enc_u32(maxpacket))
+
+
+def enc_open_failure(recipient: int, reason: int = 3, description: bytes = b"channel refused") -> bytes:
+    """Generic CHANNEL_OPEN_FAILURE (reason 3 = administratively prohibited)."""
+    return (bytes([MSG_CHANNEL_OPEN_FAILURE]) + W.enc_u32(recipient)
+            + W.enc_u32(reason) + W.enc_string(description) + W.enc_string(b""))
+
+
+def enc_agent_req(recipient: int, *, want_reply: bool = True) -> bytes:
+    """auth-agent-req@openssh.com session request (PROTOCOL.agent)."""
+    return (bytes([MSG_CHANNEL_REQUEST])
+            + W.enc_u32(recipient)
+            + W.enc_string(b"auth-agent-req@openssh.com")
+            + W.enc_bool(want_reply))

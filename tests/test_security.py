@@ -392,9 +392,7 @@ def _mk_cert_for(host, **kw):
     from ccssh import certs as CERT
     ca = Ed25519PrivateKey.generate()
     hp = Ed25519PrivateKey.generate()
-    blob = CERT.build_cert(keytype="ssh-ed25519-cert-v01@openssh.com",
-                           pub_fields=W.enc_string(hp.public_key().public_bytes_raw()),
-                           principals=host, ca_priv=ca, **kw)
+    blob = CERT.build_cert(keytype="ssh-ed25519-cert-v01@openssh.com", pub_fields=W.enc_string(hp.public_key().public_bytes_raw()), principals=host, ca_priv=ca, **kw)
     return blob, CERT.parse_cert(blob)["sig_key"], CERT.parse_cert(blob)
 
 
@@ -410,9 +408,7 @@ def test_cert_role_and_ca_pinning():
     with pytest.raises(CERT.CertError):  # pinned to the wrong CA
         CERT.verify_cert(blob, expected_principal="h.test", is_host=True, ca_blobs=[other_blob])
     with pytest.raises(CERT.CertError):
-        CERT.build_cert(keytype="ssh-ed25519-cert-v01@openssh.com",
-                        pub_fields=W.enc_string(bytes(32)), principals="h",
-                        ca_priv=b"not-a-key")
+        CERT.build_cert(keytype="ssh-ed25519-cert-v01@openssh.com", pub_fields=W.enc_string(bytes(32)), principals="h", ca_priv=b"not-a-key")
 
 
 def test_hostcheck_ask_policy(tmp_path):

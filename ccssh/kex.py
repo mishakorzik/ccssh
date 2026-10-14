@@ -30,7 +30,7 @@ KEX_OFFER = ["mlkem768x25519-sha256", "curve25519-sha256"]
 HOSTKEY_OFFER = ["ssh-ed25519"]
 CIPHER_OFFER = ["aes128-ctr"]
 MAC_OFFER = ["hmac-sha2-256"]
-COMP_OFFER = ["none"]
+COMP_OFFER = ["none", "zlib@openssh.com"]
 LANG_OFFER: list[str] = []
 
 

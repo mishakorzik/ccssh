@@ -81,6 +81,16 @@ OPENSSH_KEYS = [
     "ssh-rsa",
     "ssh-rsa-cert-v01@openssh.com",
 ]
+# Compression methods (RFC 4253 section 6.2 + delayed draft).
+# `ssh -Q compression` on OpenSSH 10.6 reports only these two: plain `zlib`
+# (immediate, post-NEWKEYS) was dropped server-side and lives in LEGACY for
+# old boxes only. Default proposal is "none,zlib@openssh.com" (no compression
+# unless requested, exactly like OpenSSH); -C / Compression=yes swaps it to
+# "zlib@openssh.com,none".
+OPENSSH_COMPRESSION = [
+    "none",
+    "zlib@openssh.com",
+]
 
 """
  Actually implemented and covered by loopback + live tests.
@@ -132,6 +142,18 @@ SUPPORTED_HOSTKEYS = [
     "rsa-sha2-256"
 ]
 # Certificate host keys carry full CA verification (see certs.py), not opaque trust.
+
+# Compression: modern OpenSSH offers "none,zlib@openssh.com" by default
+# (disabled) and "zlib@openssh.com,none" with -C/Compression=yes. Plain
+# "zlib" (immediate, pre-auth) is legacy: implemented for old servers,
+# never offered unless named explicitly.
+SUPPORTED_COMPRESSION = [
+    "none",
+    "zlib@openssh.com",
+]
+LEGACY_COMPRESSION = [
+    "zlib",
+]
 
 LEGACY_KEX = [
     "diffie-hellman-group-exchange-sha1",
@@ -281,10 +303,55 @@ def default_kex() -> list[str]:
     return [k for k in SUPPORTED_KEX if "sntrup761" not in k]
 
 
+def default_compression(enabled: bool = False) -> list[str]:
+    """
+     Default compression offer, exactly like OpenSSH (see myproposal.h).
+
+     Disabled (default): ["none", "zlib@openssh.com"] - negotiates to
+     "none" with any modern server (client preference wins). Enabled
+     (-C / Compression=yes): ["zlib@openssh.com", "none"] - negotiates
+     to delayed compression. Plain "zlib" is legacy and never included
+     unless named explicitly (see LEGACY_COMPRESSION).
+    """
+    if enabled:
+        return ["zlib@openssh.com", "none"]
+    return ["none", "zlib@openssh.com"]
+
+
+def normalize_compression(value: bool | str | list[str] | None) -> list[str] | None:
+    """
+     Resolve a compression option to an explicit offer list.
+
+     True -> enabled offer, False -> disabled offer (OpenSSH defaults),
+     None -> pass through (caller falls back), str -> single name or
+     comma list, list -> via normalize_list against the full capability
+     set (SUPPORTED + LEGACY, so "+zlib" works for old servers).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return default_compression(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            raise ValueError("empty compression option")
+        if "," in s:
+            vals = [v.strip() for v in s.split(",")]
+        else:
+            vals = [s]
+        return normalize_list(SUPPORTED_COMPRESSION + LEGACY_COMPRESSION, vals) or []
+    base = SUPPORTED_COMPRESSION + LEGACY_COMPRESSION
+    out = normalize_list(base, list(value))
+    if not out:
+        raise ValueError("compression list is empty")
+    return out
+
+
 def coverage() -> dict[str, str]:
     return {
         "kex": f"{len(SUPPORTED_KEX)}/{len(OPENSSH_KEX)} live (sntrup761 needs liboqs)",
         "cipher": f"{len(SUPPORTED_CIPHERS)}/{len(OPENSSH_CIPHERS)} live",
         "mac": f"{len(SUPPORTED_MACS)}/{len(OPENSSH_MACS)} live (+AEAD implicit)",
         "hostkey": f"{len(SUPPORTED_HOSTKEYS)}/{len(OPENSSH_KEYS)} live (certs with CA verify)",
+        "compression": f"{len(SUPPORTED_COMPRESSION)}/{len(OPENSSH_COMPRESSION)} live (+legacy zlib)",
     }

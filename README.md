@@ -28,6 +28,10 @@ ccssh -N -L 8080:127.0.0.1:80 he1zen@host           # local forwarding only
 ccssh -L 8080:127.0.0.1:80 he1zen@host              # forward + shell (shared connection)
 ccssh -R 8080:127.0.0.1:80 he1zen@host uptime       # forward + one command
 ccssh -N -R 2022:127.0.0.1:22 he1zen@host           # remote forwarding only
+ccssh -N -D 1080 he1zen@host                        # dynamic forward: SOCKS4/5 proxy on 1080
+ccssh -A he1zen@host                                # forward the local ssh-agent
+ccssh -X he1zen@host xterm                          # forward the local X display (untrusted)
+ccssh -Y he1zen@host xterm                          # ... trusted (like ssh -Y)
 ccssh -J jumpuser@jumphost he1zen@target            # ProxyJump (comma chains ok)
 ccssh -q he1zen@host 'echo quiet'                   # quiet: no info output
 ccssh -n he1zen@host < script.sh                    # stdin from /dev/null
@@ -43,7 +47,10 @@ ccssh -o KexAlgorithms=curve25519-sha256 -o Ciphers=aes256-ctr \
       -o UserKnownHostsFile=~/.ssh/known_hosts he1zen@host
 ccssh -c aes256-ctr -m hmac-sha2-512 he1zen@host    # like ssh -c/-m
 ccssh -o HostKeyAlgorithms=+ssh-dss he1zen@oldbox   # append to the default set
-ccssh -Q cipher                                     # list supported ciphers (mac, kex, key too)
+ccssh -C he1zen@host uptime                         # like ssh -C: zlib@openssh.com
+ccssh -o Compression=yes -o CompressionLevel=9 he1zen@host  # levels 1..9, default 6
+ccssh -Q cipher                                     # list supported ciphers (mac, kex, key, compression too)
+ccssh -Q compression                                # none, zlib@openssh.com (like ssh -Q)
 ```
 
 No password or key given on a terminal? ccssh prompts
@@ -73,6 +80,10 @@ c = CCSSHClient(
     ciphers=["aes256-ctr"],            # any subset of algs.SUPPORTED_CIPHERS
     macs=["hmac-sha2-512"],            # any subset of algs.SUPPORTED_MACS
     hostkeys=["ssh-ed25519"],          # any subset of algs.SUPPORTED_HOSTKEYS
+    compression=True,                  # like ssh -C (zlib@openssh.com); False by default
+    compression_level=6,               # 1..9, like CompressionLevel
+    use_agent=True,                    # publickey via $SSH_AUTH_SOCK (RFC 9987)
+    agent_path=None,                   # ... or an explicit agent socket path
     rekey_bytes=4 * 1024**3,           # auto-rekey after this much traffic
     rekey_interval=3600.0,             # ... or this many seconds
 )
@@ -82,13 +93,24 @@ c.connect("host", port=2222, username="user",
           passphrase="key-passphrase",      # for encrypted keys
           cert_filename="~/.ssh/id_ed25519-cert.pub",
           family=0)                         # 0:any, socket.AF_INET (-4), AF_INET6 (-6)
-print(c.negotiated())  # {"cipher": ..., "mac": ..., "strict": ...}
+print(c.negotiated())  # {"kex": ..., "cipher": ..., "mac": ..., "compression": ..., ...}
 c.close()
 ```
 
-Key auth tries each `-i`/`key_filename` in turn, then falls back to the
-password - like OpenSSH. If the password method fails, the same secret
-is tried via keyboard-interactive (RFC 4256, capped rounds/prompts):
+Compression is 1:1 with OpenSSH: `zlib@openssh.com` (delayed, starts after
+auth) with `-C` / `Compression=yes` / `compression=True`, levels 1..9
+(`CompressionLevel`, default 6), `none` by default with the OpenSSH proposal
+`none,zlib@openssh.com`. Legacy `zlib` (immediate, pre-auth) interoperates
+with old servers when named explicitly (`compression=["zlib", "none"]`) but
+is never offered by default - like every other legacy primitive. Rekey keeps
+compression enabled with fresh dictionaries (RFC 4253).
+
+Key auth tries each `-i`/`key_filename` in turn, then agent keys from
+`$SSH_AUTH_SOCK` (RFC 9987: list + sign, private material never leaves the
+agent; disable with `use_agent=False`, `-o IdentityAgent=path/none` or
+`-o IdentitiesOnly=yes`), then falls back to the password - like OpenSSH.
+If the password method fails, the same secret is tried via
+keyboard-interactive (RFC 4256, capped rounds/prompts):
 servers like serveo.net that only offer `keyboard-interactive` work with
 no extra flags. Certificates pass through opaquely from the
 `ssh-ed25519-cert-v01@openssh.com` file (user certs) and are verified
@@ -226,8 +248,31 @@ tun = jump.open_channel_socket("target", 22)  # direct-tcpip, socket-shaped
 c.connect("target", username="user", password="pw", sock=tun)
 ```
 
-`-L` and `-R` cannot share one connection (one forwarder per
-connection); either one shares it with exec/sftp/shell freely.
+`-L`, `-R` and `-D` cannot share one connection (one port forwarder per
+connection); either one shares it with exec/sftp/shell - and with agent
+(`-A`) and X11 (`-X`/`-Y`) forwarding - freely.
+
+## Dynamic forwarding (`-D`), agent (`-A`) and X11 (`-X`/`-Y`)
+
+```python
+dfwd = c.forward_dynamic(1080)  # SOCKS4/4a/5 proxy on 127.0.0.1:1080
+# point a browser at socks5://127.0.0.1:1080; each CONNECT becomes one
+# direct-tcpip channel through the server (TCP only, like ssh -D)
+dfwd.close()
+
+c.forward_agent()  # ssh -A: relay auth-agent@openssh.com to $SSH_AUTH_SOCK
+print(c.exec_command("ssh-add -l", forward_agent=True)[0])  # remote sees local keys
+# refused auth-agent-req (AllowAgentForwarding no) only warns: the session
+# continues without forwarding, like a refused pty
+
+c.forward_x11()  # ssh -X: relay x11 channels to the local $DISPLAY
+print(c.exec_command("echo $DISPLAY", x11=True)[0])  # server-assigned display
+# x11=True is untrusted (-X), x11_trusted=True is -Y; a refused x11-req or a
+# missing local DISPLAY only warns (fake cookie, per-connection refusal)
+```
+
+`-o ForwardAgent=yes/no`, `-o ForwardX11=yes/no`,
+`-o ForwardX11Trusted=yes/no` mirror the flags.
 
 ## Rekey
 
@@ -246,11 +291,12 @@ closed). Rekey also happens automatically per `rekey_bytes` /
 ```python
 from ccssh import algs
 print(algs.coverage())
-# kex 14/16, ciphers 6/10, MACs 6/16 + certs - all live-verified vs OpenSSH
+# kex 14/16, ciphers 6/10, MACs 6/16, compression 2/2 + certs - all live-verified vs OpenSSH
 print(algs.SUPPORTED_KEX)      # incl. "mlkem768x25519-sha256"
 print(algs.SUPPORTED_CIPHERS)  # aes*-ctr, aes*gcm, chacha20-poly1305
 print(algs.SUPPORTED_MACS)     # hmac-sha2-*, hmac-sha1 (+-etm)
 print(algs.SUPPORTED_HOSTKEYS) # incl. "ssh-mldsa44-ed25519"
+print(algs.SUPPORTED_COMPRESSION)  # none, zlib@openssh.com (like ssh -Q)
 ```
 
 The strict top tier (`algs.MAX_KEX`, `MAX_CIPHERS`, `MAX_MACS`,
@@ -260,10 +306,10 @@ still intersects with the server, so it fails closed when the server
 lacks top-tier algorithms instead of silently downgrading.
 
 Legacy algorithms (`algs.LEGACY_KEX`, `LEGACY_CIPHERS`, `LEGACY_MACS`,
-`LEGACY_HOSTKEYS`: CBC ciphers, 3DES, MD5/SHA1-96/UMAC MACs, group1-sha1,
-gex-sha1, ssh-rsa host keys) are implemented and live-tested but never
-offered by default - name them explicitly to interoperate with old
-servers. The server side needs them enabled too:
+`LEGACY_HOSTKEYS`, `LEGACY_COMPRESSION`: CBC ciphers, 3DES, MD5/SHA1-96/UMAC
+MACs, group1-sha1, gex-sha1, ssh-rsa host keys, plain `zlib`) are implemented
+and live-tested but never offered by default - name them explicitly to
+interoperate with old servers. The server side needs them enabled too:
 
 ```bash
 # sshd_config on the old box
@@ -376,7 +422,7 @@ import asyncio
 from ccssh import AsyncCCSSHClient
 
 async def go():
-    c = AsyncCCSSHClient(host_policy="off") # same knobs as sync (no rekey timers yet)
+    c = AsyncCCSSHClient(host_policy="off") # same knobs as sync (incl. compression/compression_level)
     await c.connect("host", username="u", password="pw", family=0)
     out, err, code = await c.exec_command("echo hi")
     await c.rekey()
